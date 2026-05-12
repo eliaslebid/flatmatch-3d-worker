@@ -58,7 +58,7 @@ CHECKPOINT_PATH = os.environ.get(
 
 # Lazy global model — first request pays the load cost (~6s), subsequent reuse.
 _MODEL = None
-_DEVICE = torch.device("cpu")
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _get_model() -> torch.nn.Module:
