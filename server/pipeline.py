@@ -84,48 +84,64 @@ def _hloc_glomap_sfm(
 ) -> None:
     """SuperPoint+SuperGlue feature extraction → COLMAP DB → GLOMAP mapper.
 
-    Produces a COLMAP-format sparse model at out_dir/sparse/0/ that
-    nerfstudio's `ns-process-data colmap` can ingest.
+    hloc handles feature extraction + matching using SuperPoint+SuperGlue (much
+    better than COLMAP's SIFT defaults on textureless indoor scenes). We then
+    feed the resulting matches to GLOMAP for global SfM.
     """
-    from hloc import extract_features, match_features, pairs_from_sequential, triangulation
+    from hloc import extract_features, match_features, reconstruction
 
     out_dir.mkdir(parents=True, exist_ok=True)
     sfm_pairs = out_dir / "pairs.txt"
     feature_path = out_dir / "features.h5"
     match_path = out_dir / "matches.h5"
-    db_path = out_dir / "database.db"
-    sparse_dir = out_dir / "sparse"
+    sparse_dir = out_dir / "sparse" / "0"
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     feature_conf = extract_features.confs["superpoint_aachen"]
     matcher_conf = match_features.confs["superglue"]
 
+    # 1. SuperPoint feature extraction
     extract_features.main(feature_conf, frames_dir, feature_path=feature_path)
-    pairs_from_sequential.main(sfm_pairs, sorted(frames_dir.glob("*.jpg")), window_size=10, loop=True)
+
+    # 2. Sequential pair generation (each frame paired with next N + loop closure).
+    images = sorted(p.name for p in frames_dir.glob("*.jpg"))
+    window = 10
+    pairs: list[tuple[str, str]] = []
+    n = len(images)
+    for i in range(n):
+        for j in range(i + 1, min(i + 1 + window, n)):
+            pairs.append((images[i], images[j]))
+    # Sparse loop-closure pairs (every 30 frames against every other 30 frame)
+    if n > 30:
+        anchors = list(range(0, n, max(1, n // 20)))
+        for a in anchors:
+            for b in anchors:
+                if a < b and (b - a) > window:
+                    pairs.append((images[a], images[b]))
+    sfm_pairs.write_text("\n".join(f"{a} {b}" for a, b in pairs))
+
+    # 3. SuperGlue match the pairs
     match_features.main(matcher_conf, sfm_pairs, features=feature_path, matches=match_path)
 
-    # COLMAP feature_import + sequential matcher to populate the DB,
-    # then GLOMAP mapper for global SfM.
-    _stream_run(
-        ["colmap", "feature_importer",
-         "--database_path", str(db_path),
-         "--image_path", str(frames_dir),
-         "--features_path", str(feature_path)],
-        log_path=log_path,
+    # 4. hloc reconstruction writes a COLMAP database + sparse model. We let
+    # hloc do the database+import work, then let GLOMAP re-do the mapping.
+    db_path = out_dir / "database.db"
+    reconstruction.main(
+        sfm_dir=out_dir,
+        image_dir=frames_dir,
+        pairs=sfm_pairs,
+        features=feature_path,
+        matches=match_path,
+        camera_mode="SINGLE",
+        verbose=False,
     )
-    _stream_run(
-        ["colmap", "matches_importer",
-         "--database_path", str(db_path),
-         "--match_list_path", str(sfm_pairs),
-         "--matches_path", str(match_path),
-         "--match_type", "pairs"],
-        log_path=log_path,
-    )
+
+    # GLOMAP global mapper over the hloc-populated DB.
     _stream_run(
         ["glomap", "mapper",
          "--database_path", str(db_path),
          "--image_path", str(frames_dir),
-         "--output_path", str(sparse_dir)],
+         "--output_path", str(out_dir / "sparse")],
         log_path=log_path,
     )
 
