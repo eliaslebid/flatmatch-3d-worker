@@ -24,13 +24,11 @@ from typing import Optional
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-# render_cuda_ext ships .so extensions next to a Python wrapper; the renderer
-# imports `from render_cuda_ext import voxelize_frame` from within rgbd_render.
-RENDER_EXT_DIR = REPO_ROOT / "demo_render" / "render_cuda_ext"
-if RENDER_EXT_DIR.exists() and str(RENDER_EXT_DIR) not in sys.path:
-    sys.path.insert(0, str(RENDER_EXT_DIR))
+DEMO_RENDER_DIR = REPO_ROOT / "demo_render"
+RENDER_EXT_DIR = DEMO_RENDER_DIR / "render_cuda_ext"
+for p in (REPO_ROOT, DEMO_RENDER_DIR, RENDER_EXT_DIR):
+    if p.exists() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 from demo import (  # noqa: E402  (demo.py is the script in the repo root)
     load_images,
