@@ -1,175 +1,173 @@
-"""Run lingbot-map inference and export a colored point-cloud GLB.
+"""Gaussian Splatting pipeline: video → COLMAP → splatfacto → MP4 flythrough.
 
-This is the v0 "GLB beta" path: model inference + depth unprojection +
-voxel-grid downsampling + trimesh export. Works on either CPU or CUDA.
-
-The official rgbd_render MP4 pipeline (in demo_render/) was attempted but
-silently segfaults inside Kaolin's octree builder on our pod env. Tracked
-for v2 along with a Gaussian Splatting alternative — see
-https://github.com/eliaslebid/flatmatch-3d-worker/blob/main/ARCHITECTURE.md
+End-to-end:
+  1. ffmpeg extract frames at fps=5
+  2. ns-process-data images (runs COLMAP feature matching + SfM)
+  3. ns-train splatfacto (5-15 min on a 4090/L40S)
+  4. ns-render interpolate → MP4 of the trained gaussians
+  5. ns-export gaussian-splat → .ply of the trained gaussians (best-effort)
 """
 
 from __future__ import annotations
 
-import contextlib
-import os
-import sys
+import re
+import shutil
+import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-import numpy as np
-import torch
-import trimesh
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from demo import (  # noqa: E402
-    load_images,
-    load_model,
-    postprocess,
-    prepare_for_visualization,
-)
-from lingbot_map.utils.geometry import (  # noqa: E402
-    unproject_depth_map_to_point_map,
-)
-from server import progress as progress_mod  # noqa: E402
+from server import progress as progress_mod
 
 
-@dataclass
-class InferenceArgs:
-    """Minimal stand-in for the argparse Namespace that load_model expects."""
+def _stream_run(
+    cmd: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    log_path: Optional[Path] = None,
+    on_line: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Run cmd; stream stdout to log + optional callback; raise on non-zero."""
+    if log_path:
+        with log_path.open("ab") as logf:
+            logf.write(f"\n$ {' '.join(cmd)}\n".encode())
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if log_path:
+            with log_path.open("a") as logf:
+                logf.write(line)
+        if on_line:
+            try:
+                on_line(line)
+            except Exception:
+                pass
+    proc.wait()
+    if proc.returncode != 0:
+        tail = ""
+        if log_path and log_path.exists():
+            tail = "\n".join(log_path.read_text().splitlines()[-40:])
+        raise RuntimeError(
+            f"`{cmd[0]}` exited {proc.returncode}\n--- log tail ---\n{tail}"
+        )
 
-    model_path: str
-    mode: str = "streaming"
-    image_size: int = 518
-    patch_size: int = 14
-    enable_3d_rope: bool = True
-    max_frame_num: int = 320
-    kv_cache_sliding_window: int = 320
-    num_scale_frames: int = 8
-    use_sdpa: bool = True
-    camera_num_iterations: int = 4
+
+def _find_config_yml(train_root: Path) -> Path:
+    candidates = sorted(
+        train_root.glob("outputs/**/config.yml"), key=lambda p: p.stat().st_mtime
+    )
+    if not candidates:
+        raise RuntimeError(f"no nerfstudio config.yml under {train_root}/outputs/")
+    return candidates[-1]
 
 
-CHECKPOINT_PATH = os.environ.get(
-    "LINGBOT_CHECKPOINT",
-    str(REPO_ROOT / "checkpoints" / "lingbot-map-long.pt")
-    if (REPO_ROOT / "checkpoints" / "lingbot-map-long.pt").exists()
-    else str(REPO_ROOT / "checkpoints" / "lingbot-map.pt"),
-)
-
-_MODEL = None
-_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def _get_model() -> torch.nn.Module:
-    global _MODEL
-    if _MODEL is None:
-        args = InferenceArgs(model_path=CHECKPOINT_PATH)
-        _MODEL = load_model(args, _DEVICE)
-        if _DEVICE.type == "cuda" and getattr(_MODEL, "aggregator", None) is not None:
-            _MODEL.aggregator = _MODEL.aggregator.to(dtype=torch.bfloat16)
-    return _MODEL
+_STEP_RE = re.compile(r"Step\s+(\d+)\s*/\s*(\d+)")
 
 
 def run_scan(
     video_path: Path,
-    output_glb: Path,
+    output_mp4: Path,
     *,
     fps: int = 5,
-    first_k: Optional[int] = 300,
-    conf_threshold: float = 1.5,
-    max_points: int = 500_000,
+    max_iterations: int = 7000,
     progress_path: Optional[Path] = None,
 ) -> dict:
-    if _DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
     t0 = time.time()
-    output_glb.parent.mkdir(parents=True, exist_ok=True)
+    scan_dir = output_mp4.parent
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    log_path = scan_dir / "gsplat.log"
     progress_mod.set_path(progress_path)
+
+    work_dir = scan_dir / "ns_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    raw_frames = work_dir / "raw_frames"
+    raw_frames.mkdir(parents=True, exist_ok=True)
+    processed = work_dir / "processed"
 
     try:
         progress_mod.set_phase("extracting")
-        images, _paths, _folder = load_images(
-            video_path=str(video_path),
-            fps=fps,
-            first_k=first_k,
-            image_size=518,
-            patch_size=14,
+        _stream_run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-vf", f"fps={fps}",
+             str(raw_frames / "frame_%05d.jpg")],
+            log_path=log_path,
         )
-        num_frames = int(images.shape[0])
-        if num_frames < 2:
-            raise ValueError(f"Need at least 2 frames, got {num_frames}")
+        n_raw = len(list(raw_frames.glob("frame_*.jpg")))
+        if n_raw < 10:
+            raise ValueError(f"Need >=10 frames, got {n_raw}")
 
-        progress_mod.set_phase("loading_model")
-        model = _get_model()
-        images_dev = images.to(_DEVICE)
-
-        progress_mod.set_phase("inferring", current=0, total=num_frames)
-        amp_ctx = (
-            torch.amp.autocast("cuda", dtype=torch.bfloat16)
-            if _DEVICE.type == "cuda"
-            else contextlib.nullcontext()
+        progress_mod.set_phase("colmap")
+        _stream_run(
+            ["ns-process-data", "images",
+             "--data", str(raw_frames),
+             "--output-dir", str(processed),
+             "--matching-method", "sequential",
+             "--num-downscales", "0",
+             "--verbose"],
+            log_path=log_path,
         )
-        t_infer = time.time()
-        with torch.no_grad(), amp_ctx:
-            predictions = model.inference_streaming(
-                images_dev,
-                num_scale_frames=8,
-                keyframe_interval=1,
-                output_device=torch.device("cpu"),
+
+        progress_mod.set_phase("training", current=0, total=max_iterations)
+
+        def _on_train_line(line: str) -> None:
+            m = _STEP_RE.search(line)
+            if m:
+                progress_mod.set_phase(
+                    "training", current=int(m.group(1)), total=int(m.group(2))
+                )
+
+        train_outputs = work_dir / "outputs"
+        train_outputs.mkdir(parents=True, exist_ok=True)
+        _stream_run(
+            ["ns-train", "splatfacto",
+             "--data", str(processed),
+             "--output-dir", str(train_outputs),
+             "--max-num-iterations", str(max_iterations),
+             "--viewer.quit-on-train-completion", "True",
+             "--vis", "tensorboard"],
+            cwd=work_dir,
+            log_path=log_path,
+            on_line=_on_train_line,
+        )
+
+        progress_mod.set_phase("rendering")
+        config_yml = _find_config_yml(work_dir)
+        _stream_run(
+            ["ns-render", "interpolate",
+             "--load-config", str(config_yml),
+             "--output-path", str(output_mp4),
+             "--frame-rate", "30",
+             "--interpolation-steps", "30"],
+            log_path=log_path,
+        )
+
+        ply_path = scan_dir / "scan.ply"
+        try:
+            _stream_run(
+                ["ns-export", "gaussian-splat",
+                 "--load-config", str(config_yml),
+                 "--output-dir", str(scan_dir)],
+                log_path=log_path,
             )
-        t_infer = time.time() - t_infer
-
-        progress_mod.set_phase("exporting")
-        predictions, images_cpu = postprocess(predictions, images_dev)
-        vis = prepare_for_visualization(predictions, images_cpu)
-
-        depth = vis["depth"]
-        depth_conf = vis["depth_conf"]
-        extrinsic = vis["extrinsic"]
-        intrinsic = vis["intrinsic"]
-        imgs = vis["images"]
-
-        world = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
-        pts = world.reshape(-1, 3)
-        colors = imgs.transpose(0, 2, 3, 1).reshape(-1, 3)
-        conf = depth_conf.reshape(-1)
-
-        mask = np.isfinite(pts).all(axis=1) & (conf >= conf_threshold)
-        pts = pts[mask]
-        colors = colors[mask]
-
-        # Voxel-grid downsample preserves spatial structure better than random.
-        if len(pts) > max_points:
-            lo = np.percentile(pts, 1, axis=0)
-            hi = np.percentile(pts, 99, axis=0)
-            scene_diag = float(np.linalg.norm(hi - lo))
-            voxel_size = max(scene_diag / 500.0, 1e-4)
-            for _ in range(6):
-                grid = np.floor(pts / voxel_size).astype(np.int64)
-                _, idx = np.unique(grid, axis=0, return_index=True)
-                if len(idx) <= max_points * 1.1:
-                    break
-                voxel_size *= 1.4
-            idx.sort()
-            pts = pts[idx]
-            colors = colors[idx]
-
-        colors_u8 = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
-        cloud = trimesh.PointCloud(vertices=pts.astype(np.float32), colors=colors_u8)
-        trimesh.Scene([cloud]).export(str(output_glb), file_type="glb")
+            default_ply = scan_dir / "splat.ply"
+            if default_ply.exists():
+                default_ply.rename(ply_path)
+        except Exception:
+            ply_path = None
 
         return {
-            "frames": num_frames,
-            "points": int(len(pts)),
-            "inference_seconds": round(t_infer, 1),
+            "frames": n_raw,
+            "iterations": max_iterations,
             "total_seconds": round(time.time() - t0, 1),
-            "glb_bytes": output_glb.stat().st_size,
+            "mp4_bytes": output_mp4.stat().st_size if output_mp4.exists() else 0,
+            "ply_bytes": ply_path.stat().st_size if ply_path and ply_path.exists() else 0,
         }
     finally:
         progress_mod.set_path(None)
+        shutil.rmtree(raw_frames, ignore_errors=True)
