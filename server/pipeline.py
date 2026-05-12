@@ -125,6 +125,10 @@ def _render_to_mp4(npz_dir: Path, output_mp4: Path) -> None:
     cfg.input = str(npz_dir)
     cfg.output = str(output_mp4)
     cfg.fast_review = 0
+    # Force single-process rendering: the default num_workers=16 spawns
+    # multiprocessing children, which kill the uvicorn parent when running
+    # inside a FastAPI BackgroundTask.
+    cfg.num_workers = 1
     # Sky masking is for outdoor scenes; off for indoor.
     cfg.preprocess.mask_sky = False
 
