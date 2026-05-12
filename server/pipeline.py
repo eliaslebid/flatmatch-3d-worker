@@ -84,6 +84,9 @@ def run_scan(
     max_points: int = 500_000,
     progress_path: Optional[Path] = None,
 ) -> dict:
+    if _DEVICE.type == "cuda":
+        # Release any cached blocks from a previous (possibly failed) run.
+        torch.cuda.empty_cache()
     """Run inference on a video and write a colored point-cloud GLB.
 
     Returns metadata about the scan: timing, frame count, point count.
@@ -127,13 +130,16 @@ def run_scan(
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
             if _DEVICE.type == "cuda" and hasattr(model, "inference_windowed"):
+                # Tight settings to fit the model + KV cache on a 24 GB 4090.
+                # window_size=64 + keyframe_interval=4 means each window holds
+                # 64 KV slots and covers (64 - 4) * 4 = 240 actual frames.
                 predictions = model.inference_windowed(
                     images_dev,
-                    window_size=128,
+                    window_size=64,
                     overlap_size=0,
-                    overlap_keyframes=8,
+                    overlap_keyframes=4,
                     num_scale_frames=num_scale_frames,
-                    keyframe_interval=keyframe_interval,
+                    keyframe_interval=4,
                     output_device=torch.device("cpu"),
                 )
             else:
