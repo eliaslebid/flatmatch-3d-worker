@@ -105,8 +105,8 @@ def get_scan(scan_id: str) -> JSONResponse:
     meta = dict(meta)
     scan_dir = _scan_dir(scan_id)
     if meta.get("status") == "done":
-        if (scan_dir / "scan.sog").exists():
-            meta["sog_url"] = f"/scans/{scan_id}/scan.sog"
+        if (scan_dir / "scan.spz").exists():
+            meta["spz_url"] = f"/scans/{scan_id}/scan.spz"
         if (scan_dir / "scan.ply").exists():
             meta["ply_url"] = f"/scans/{scan_id}/scan.ply"
         if (scan_dir / "scan.mp4").exists():
@@ -137,12 +137,12 @@ def get_ply(scan_id: str) -> FileResponse:
     return FileResponse(ply, media_type="application/octet-stream", filename="scan.ply")
 
 
-@app.get("/scans/{scan_id}/scan.sog")
-def get_sog(scan_id: str) -> FileResponse:
-    sog = _scan_dir(scan_id) / "scan.sog"
-    if not sog.exists():
-        raise HTTPException(status_code=404, detail="sog not ready")
-    return FileResponse(sog, media_type="application/octet-stream", filename="scan.sog")
+@app.get("/scans/{scan_id}/scan.spz")
+def get_spz(scan_id: str) -> FileResponse:
+    spz = _scan_dir(scan_id) / "scan.spz"
+    if not spz.exists():
+        raise HTTPException(status_code=404, detail="spz not ready")
+    return FileResponse(spz, media_type="application/octet-stream", filename="scan.spz")
 
 
 @app.get("/health")

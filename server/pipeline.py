@@ -268,19 +268,20 @@ def run_scan(
         if default_ply.exists() and not ply_path.exists():
             default_ply.rename(ply_path)
 
-        # 6. Compress to SOG (PlayCanvas Spatially Ordered Gaussians)
+        # 6. Compress to SPZ (Niantic, 10× smaller than PLY, supported by
+        # mkkellogg/gaussian-splats-3d which is the mobile WebView viewer).
         progress_mod.set_phase("compressing")
-        sog_path = scan_dir / "scan.sog"
+        spz_path = scan_dir / "scan.spz"
         if ply_path.exists():
             try:
                 _stream_run(
-                    ["splat-transform", str(ply_path), str(sog_path)],
+                    ["splat-transform", str(ply_path), str(spz_path)],
                     log_path=log_path,
                 )
             except Exception:
-                sog_path = None
+                spz_path = None
         else:
-            sog_path = None
+            spz_path = None
 
         # 7. Optional preview MP4 flythrough as a fallback
         progress_mod.set_phase("rendering")
@@ -302,7 +303,7 @@ def run_scan(
             "total_seconds": round(time.time() - t0, 1),
             "mp4_bytes": output_mp4.stat().st_size if output_mp4.exists() else 0,
             "ply_bytes": ply_path.stat().st_size if ply_path.exists() else 0,
-            "sog_bytes": sog_path.stat().st_size if sog_path and sog_path.exists() else 0,
+            "spz_bytes": spz_path.stat().st_size if spz_path and spz_path.exists() else 0,
         }
     finally:
         progress_mod.set_path(None)
