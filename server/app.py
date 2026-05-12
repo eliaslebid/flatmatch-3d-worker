@@ -21,12 +21,14 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from server.pipeline import run_scan
+from server.v2_router import router as v2_router
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SCAN_DATA_DIR", ROOT / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="modula 3d scan worker (gsplat)", version="0.2.0")
+app.include_router(v2_router)
 
 _pipeline_lock = threading.Lock()
 

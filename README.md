@@ -45,7 +45,26 @@ GPU (RunPod RTX 4090 recommended) and serve a single mobile beta user.
 
 ## Endpoints
 
+### v1 — video input (legacy path)
+
 - `POST /scans` — multipart `video=@scan.mp4`. Returns `{ id, status: "queued", ... }`.
 - `GET /scans/{id}` — full meta including `status`, `progress`, `glb_url`.
 - `GET /scans/{id}/scan.glb` — the colored point-cloud GLB.
 - `GET /health` — `{ ok: true, queue_locked: bool }`.
+
+### v2 — iPhone guided-capture (photos + ARKit poses)
+
+Companion path for the A/B test. Mobile client uploads a zip of
+`images/*.jpg + transforms.json` (nerfstudio format with intrinsics +
+per-frame poses), worker skips SfM and feeds straight into splatfacto.
+
+**Currently a stub**: accepts the upload, walks through realistic status
+transitions, emits a synthesized 8-gaussian sample PLY so the mobile and
+WebView viewer plumbing can be verified end-to-end before the real
+splatfacto pipeline lands.
+
+- `POST /v2/scan` — multipart `archive=@capture.zip`. Returns `{ id, engine: "v2", status: "queued", ... }`.
+- `GET /v2/scan` — list all v2 scans newest first.
+- `GET /v2/scan/{id}` — meta including `progress.step`, `progress.pct`, `ply_url`, `mp4_url`, `stub`.
+- `GET /v2/scan/{id}/scene.ply` — the trained splat (sample PLY while stubbed).
+- `GET /v2/scan/{id}/scene.mp4` — flythrough render (not produced by the stub yet).
