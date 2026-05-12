@@ -123,9 +123,10 @@ def _hloc_glomap_sfm(
     # 3. SuperGlue match the pairs
     match_features.main(matcher_conf, sfm_pairs, features=feature_path, matches=match_path)
 
-    # 4. hloc reconstruction writes a COLMAP database + sparse model. We let
-    # hloc do the database+import work, then let GLOMAP re-do the mapping.
-    db_path = out_dir / "database.db"
+    # 4. hloc reconstruction creates the COLMAP database AND runs pycolmap's
+    # incremental mapper. Produces sparse/0/{cameras,images,points3D}.bin
+    # directly. We skipped GLOMAP because its CMake-built COLMAP fork can't
+    # read the SQLite DB that hloc's bundled pycolmap writes.
     reconstruction.main(
         sfm_dir=out_dir,
         image_dir=frames_dir,
@@ -134,15 +135,6 @@ def _hloc_glomap_sfm(
         matches=match_path,
         camera_mode="SINGLE",
         verbose=False,
-    )
-
-    # GLOMAP global mapper over the hloc-populated DB.
-    _stream_run(
-        ["glomap", "mapper",
-         "--database_path", str(db_path),
-         "--image_path", str(frames_dir),
-         "--output_path", str(out_dir / "sparse")],
-        log_path=log_path,
     )
 
 
