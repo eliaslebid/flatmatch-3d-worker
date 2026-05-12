@@ -90,57 +90,39 @@ def _save_predictions_npz(predictions, npz_dir: Path) -> str:
 
 
 def _render_to_mp4(npz_dir: Path, output_mp4: Path) -> None:
-    """Run the official rgbd_render pipeline on saved NPZ predictions.
+    """Run the official rgbd_render pipeline as a SUBPROCESS.
 
-    Loads the indoor preset (follow-cam, sky off, indoor scale), then
-    SceneBuilder -> voxelize -> OfflinePipeline -> MP4.
+    Kaolin / Open3D / the custom CUDA extensions can segfault the host
+    process; running rendering out-of-process means a crash only marks the
+    scan failed instead of killing the uvicorn worker for everyone.
     """
-    import multiprocessing
+    import subprocess
 
-    if multiprocessing.get_start_method(allow_none=True) != "spawn":
+    log_path = output_mp4.parent / "render.log"
+    cmd = [
+        sys.executable,
+        "-m",
+        "server.render_runner",
+        str(npz_dir),
+        str(output_mp4),
+    ]
+    with log_path.open("w") as logf:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if proc.returncode != 0:
+        tail = ""
         try:
-            multiprocessing.set_start_method("spawn", force=True)
-        except RuntimeError:
+            tail = "\n".join(log_path.read_text().splitlines()[-30:])
+        except Exception:
             pass
-
-    # rgbd_render lives under demo_render/. We add demo_render/ and
-    # render_cuda_ext/ to sys.path *here* (after demo has already been
-    # imported and cached in sys.modules) so we don't shadow the top-level
-    # demo.py with demo_render/demo.py.
-    for p in (DEMO_RENDER_DIR, RENDER_EXT_DIR):
-        if p.exists() and str(p) not in sys.path:
-            sys.path.insert(0, str(p))
-
-    from rgbd_render.config import PipelineConfig
-    from rgbd_render.camera import build_camera_path
-    from rgbd_render.overlay import build_overlays
-    from rgbd_render.pipeline.builder import SceneBuilder
-    from rgbd_render.pipeline.offline import OfflinePipeline
-
-    cfg = (
-        PipelineConfig.from_yaml(str(INDOOR_YAML))
-        if INDOOR_YAML.exists()
-        else PipelineConfig()
-    )
-    cfg.input = str(npz_dir)
-    cfg.output = str(output_mp4)
-    cfg.fast_review = 0
-    # Force single-process rendering: the default num_workers=16 spawns
-    # multiprocessing children, which kill the uvicorn parent when running
-    # inside a FastAPI BackgroundTask.
-    cfg.num_workers = 1
-    # Sky masking is for outdoor scenes; off for indoor.
-    cfg.preprocess.mask_sky = False
-
-    scene = SceneBuilder(cfg).load().preprocess().voxelize().build()
-    try:
-        camera_path = build_camera_path(cfg.camera, scene)
-        overlays, overlay_specs = build_overlays(cfg, scene)
-        OfflinePipeline(
-            scene, camera_path, overlays, cfg, overlay_specs=overlay_specs
-        ).run()
-    finally:
-        scene.destroy()
+        raise RuntimeError(
+            f"render_runner exited {proc.returncode}\n--- render.log tail ---\n{tail}"
+        )
 
 
 def run_scan(
