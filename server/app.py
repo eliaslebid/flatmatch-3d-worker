@@ -64,9 +64,9 @@ def _process(scan_id: str) -> None:
         _write_meta(scan_id, meta)
         try:
             video = _scan_dir(scan_id) / "input.mp4"
-            glb = _scan_dir(scan_id) / "scan.glb"
+            mp4 = _scan_dir(scan_id) / "scan.mp4"
             progress = _scan_dir(scan_id) / "progress.json"
-            result = run_scan(video, glb, progress_path=progress)
+            result = run_scan(video, mp4, progress_path=progress)
             meta["status"] = "done"
             meta["finished_at"] = _now()
             meta["result"] = result
@@ -112,7 +112,12 @@ def get_scan(scan_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="scan not found")
     meta = dict(meta)
     if meta.get("status") == "done":
-        meta["glb_url"] = f"/scans/{scan_id}/scan.glb"
+        # Prefer MP4 (official rgbd_render output); GLB only exists on legacy scans.
+        scan_dir = _scan_dir(scan_id)
+        if (scan_dir / "scan.mp4").exists():
+            meta["mp4_url"] = f"/scans/{scan_id}/scan.mp4"
+        if (scan_dir / "scan.glb").exists():
+            meta["glb_url"] = f"/scans/{scan_id}/scan.glb"
     if meta.get("status") == "processing":
         progress_path = _scan_dir(scan_id) / "progress.json"
         if progress_path.exists():
@@ -129,6 +134,14 @@ def get_glb(scan_id: str) -> FileResponse:
     if not glb.exists():
         raise HTTPException(status_code=404, detail="glb not ready")
     return FileResponse(glb, media_type="model/gltf-binary", filename="scan.glb")
+
+
+@app.get("/scans/{scan_id}/scan.mp4")
+def get_mp4(scan_id: str) -> FileResponse:
+    mp4 = _scan_dir(scan_id) / "scan.mp4"
+    if not mp4.exists():
+        raise HTTPException(status_code=404, detail="mp4 not ready")
+    return FileResponse(mp4, media_type="video/mp4", filename="scan.mp4")
 
 
 @app.get("/health")

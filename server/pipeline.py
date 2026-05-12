@@ -1,8 +1,14 @@
-"""Run lingbot-map inference on a video and export a colored point-cloud GLB.
+"""Run lingbot-map inference and render the official rgbd_render MP4 flythrough.
 
-Wraps the demo.py functions (load_images, load_model, postprocess,
-prepare_for_visualization) so the FastAPI worker can call into them without
-shelling out to demo.py.
+This is the same pipeline that produces the demo videos on the repo:
+  video -> frames -> model.inference_streaming -> NPZ -> SceneBuilder
+       -> CUDA voxelization (NVIDIA Kaolin) -> OfflinePipeline -> MP4
+
+Requires the pod to have:
+  - torch 2.8.0 + cu128 wheels
+  - lingbot-map[vis,render] (open3d, pyyaml, viser, trimesh)
+  - kaolin built for torch 2.8 / cu128
+  - demo_render/render_cuda_ext built in-place (voxel_morton_ext + frustum_cull_ext)
 """
 
 from __future__ import annotations
@@ -15,22 +21,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import torch
-import trimesh
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+# render_cuda_ext ships .so extensions next to a Python wrapper; the renderer
+# imports `from render_cuda_ext import voxelize_frame` from within rgbd_render.
+RENDER_EXT_DIR = REPO_ROOT / "demo_render" / "render_cuda_ext"
+if RENDER_EXT_DIR.exists() and str(RENDER_EXT_DIR) not in sys.path:
+    sys.path.insert(0, str(RENDER_EXT_DIR))
 
 from demo import (  # noqa: E402  (demo.py is the script in the repo root)
     load_images,
     load_model,
     postprocess,
     prepare_for_visualization,
-)
-from lingbot_map.utils.geometry import (  # noqa: E402
-    unproject_depth_map_to_point_map,
 )
 from server import progress as progress_mod  # noqa: E402
 
@@ -40,8 +46,6 @@ class InferenceArgs:
     """Minimal stand-in for the argparse Namespace that load_model expects."""
 
     model_path: str
-    # Streaming is the paper-spec mode for ≤320 frame scans. We cap input
-    # at 300 frames upstream, so streaming is always fine.
     mode: str = "streaming"
     image_size: int = 518
     patch_size: int = 14
@@ -55,14 +59,13 @@ class InferenceArgs:
 
 CHECKPOINT_PATH = os.environ.get(
     "LINGBOT_CHECKPOINT",
-    # Prefer the long-sequence checkpoint when available — it's tuned for
-    # indoor walkthroughs and large-scale scenes per the model card.
     str(REPO_ROOT / "checkpoints" / "lingbot-map-long.pt")
     if (REPO_ROOT / "checkpoints" / "lingbot-map-long.pt").exists()
     else str(REPO_ROOT / "checkpoints" / "lingbot-map.pt"),
 )
 
-# Lazy global model — first request pays the load cost (~6s), subsequent reuse.
+INDOOR_YAML = REPO_ROOT / "demo_render" / "config" / "indoor.yaml"
+
 _MODEL = None
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -72,33 +75,77 @@ def _get_model() -> torch.nn.Module:
     if _MODEL is None:
         args = InferenceArgs(model_path=CHECKPOINT_PATH)
         _MODEL = load_model(args, _DEVICE)
-        # On CUDA, cast the DINOv2-style aggregator to bf16 to drop a redundant
-        # fp32 master weight copy (~2-3 GB saved). Heads stay fp32 internally
-        # under autocast(enabled=False).
         if _DEVICE.type == "cuda" and getattr(_MODEL, "aggregator", None) is not None:
             _MODEL.aggregator = _MODEL.aggregator.to(dtype=torch.bfloat16)
     return _MODEL
 
 
+def _save_predictions_npz(predictions, npz_dir: Path) -> str:
+    """Wrapper around batch_demo.save_predictions_npz that takes a Path."""
+    from demo_render.batch_demo import save_predictions_npz
+
+    return save_predictions_npz(predictions, str(npz_dir))
+
+
+def _render_to_mp4(npz_dir: Path, output_mp4: Path) -> None:
+    """Run the official rgbd_render pipeline on saved NPZ predictions.
+
+    Loads the indoor preset (follow-cam, sky off, indoor scale), then
+    SceneBuilder -> voxelize -> OfflinePipeline -> MP4.
+    """
+    import multiprocessing
+
+    if multiprocessing.get_start_method(allow_none=True) != "spawn":
+        try:
+            multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
+    from rgbd_render.config import PipelineConfig
+    from rgbd_render.camera import build_camera_path
+    from rgbd_render.overlay import build_overlays
+    from rgbd_render.pipeline.builder import SceneBuilder
+    from rgbd_render.pipeline.offline import OfflinePipeline
+
+    cfg = (
+        PipelineConfig.from_yaml(str(INDOOR_YAML))
+        if INDOOR_YAML.exists()
+        else PipelineConfig()
+    )
+    cfg.input = str(npz_dir)
+    cfg.output = str(output_mp4)
+    cfg.fast_review = 0
+    # Sky masking is for outdoor scenes; off for indoor.
+    cfg.preprocess.mask_sky = False
+
+    scene = SceneBuilder(cfg).load().preprocess().voxelize().build()
+    try:
+        camera_path = build_camera_path(cfg.camera, scene)
+        overlays, overlay_specs = build_overlays(cfg, scene)
+        OfflinePipeline(
+            scene, camera_path, overlays, cfg, overlay_specs=overlay_specs
+        ).run()
+    finally:
+        scene.destroy()
+
+
 def run_scan(
     video_path: Path,
-    output_glb: Path,
+    output_mp4: Path,
     *,
     fps: int = 5,
     first_k: Optional[int] = 300,
-    conf_threshold: float = 1.5,
-    max_points: int = 500_000,
     progress_path: Optional[Path] = None,
 ) -> dict:
-    if _DEVICE.type == "cuda":
-        # Release any cached blocks from a previous (possibly failed) run.
-        torch.cuda.empty_cache()
-    """Run inference on a video and write a colored point-cloud GLB.
+    """Run inference on a video and render the official MP4 flythrough.
 
-    Returns metadata about the scan: timing, frame count, point count.
+    Returns metadata about the scan: timing, frame count, mp4 size.
     """
+    if _DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
     t0 = time.time()
-    output_glb.parent.mkdir(parents=True, exist_ok=True)
+    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    npz_dir = output_mp4.parent / "predictions"
     progress_mod.set_path(progress_path)
 
     try:
@@ -116,18 +163,14 @@ def run_scan(
 
         progress_mod.set_phase("loading_model")
         model = _get_model()
-        # Keep input images in fp32 — autocast handles bf16 internally. Casting
-        # the input to bf16 causes downstream `.numpy()` failures (numpy lacks
-        # a native bf16 dtype).
         images_dev = images.to(_DEVICE)
 
-        # Paper-spec streaming: every frame cached, 8 scale frames.
-        # On the 48 GB L40S this comfortably fits up to 300 frames in bf16.
         progress_mod.set_phase("inferring", current=0, total=num_frames)
-        if _DEVICE.type == "cuda":
-            amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
-        else:
-            amp_ctx = contextlib.nullcontext()
+        amp_ctx = (
+            torch.amp.autocast("cuda", dtype=torch.bfloat16)
+            if _DEVICE.type == "cuda"
+            else contextlib.nullcontext()
+        )
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
             predictions = model.inference_streaming(
@@ -141,54 +184,16 @@ def run_scan(
         progress_mod.set_phase("exporting")
         predictions, images_cpu = postprocess(predictions, images_dev)
         vis = prepare_for_visualization(predictions, images_cpu)
+        _save_predictions_npz(vis, npz_dir)
 
-        # The streaming model returns depth + extrinsic + intrinsic; unproject to world.
-        depth = vis["depth"]              # (S, H, W, 1)
-        depth_conf = vis["depth_conf"]    # (S, H, W)
-        extrinsic = vis["extrinsic"]      # (S, 3, 4) c2w after postprocess
-        intrinsic = vis["intrinsic"]      # (S, 3, 3)
-        imgs = vis["images"]              # (S, 3, H, W) in [0,1]
-
-        world = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)  # (S, H, W, 3)
-
-        pts = world.reshape(-1, 3)
-        colors = imgs.transpose(0, 2, 3, 1).reshape(-1, 3)
-        conf = depth_conf.reshape(-1)
-
-        mask = np.isfinite(pts).all(axis=1) & (conf >= conf_threshold)
-        pts = pts[mask]
-        colors = colors[mask]
-
-        # Voxel-grid downsample: keep one point per voxel. Preserves spatial
-        # structure way better than random subsampling (which leaves sparse
-        # areas sparse and over-represents dense regions). We auto-tune the
-        # voxel size to hit roughly max_points.
-        if len(pts) > max_points:
-            lo = np.percentile(pts, 1, axis=0)
-            hi = np.percentile(pts, 99, axis=0)
-            scene_diag = float(np.linalg.norm(hi - lo))
-            voxel_size = max(scene_diag / 500.0, 1e-4)
-            for _ in range(6):
-                grid = np.floor(pts / voxel_size).astype(np.int64)
-                _, idx = np.unique(grid, axis=0, return_index=True)
-                if len(idx) <= max_points * 1.1:
-                    break
-                voxel_size *= 1.4
-            idx.sort()
-            pts = pts[idx]
-            colors = colors[idx]
-
-        colors_u8 = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
-        cloud = trimesh.PointCloud(vertices=pts.astype(np.float32), colors=colors_u8)
-        scene = trimesh.Scene([cloud])
-        scene.export(str(output_glb), file_type="glb")
+        progress_mod.set_phase("rendering")
+        _render_to_mp4(npz_dir, output_mp4)
 
         return {
             "frames": num_frames,
-            "points": int(len(pts)),
             "inference_seconds": round(t_infer, 1),
             "total_seconds": round(time.time() - t0, 1),
-            "glb_bytes": output_glb.stat().st_size,
+            "mp4_bytes": output_mp4.stat().st_size if output_mp4.exists() else 0,
         }
     finally:
         progress_mod.set_path(None)
