@@ -104,15 +104,23 @@ def run_scan(
         model = _get_model()
         images_dev = images.to(_DEVICE)
 
-        # Streaming inference (CPU → autocast is a no-op via nullcontext)
+        # Streaming inference. On GPU use bf16 autocast (matches training);
+        # on CPU autocast is a no-op via nullcontext.
         progress_mod.set_phase("inferring", current=0, total=num_frames)
-        amp_ctx = contextlib.nullcontext()
+        if _DEVICE.type == "cuda":
+            amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
+            num_scale_frames = 4
+            keyframe_interval = 2
+        else:
+            amp_ctx = contextlib.nullcontext()
+            num_scale_frames = 8
+            keyframe_interval = 1
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
             predictions = model.inference_streaming(
                 images_dev,
-                num_scale_frames=8,
-                keyframe_interval=1,
+                num_scale_frames=num_scale_frames,
+                keyframe_interval=keyframe_interval,
                 output_device=torch.device("cpu"),
             )
         t_infer = time.time() - t_infer
