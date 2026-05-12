@@ -130,16 +130,17 @@ def run_scan(
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
             if _DEVICE.type == "cuda" and hasattr(model, "inference_windowed"):
-                # Tight settings to fit the model + KV cache on a 24 GB 4090.
-                # window_size=64 + keyframe_interval=4 means each window holds
-                # 64 KV slots and covers (64 - 4) * 4 = 240 actual frames.
+                # Paper-spec settings: window_size=128 + keyframe_interval=2.
+                # Each window holds 128 KV slots and covers
+                # (128 - 4) * 2 = 248 actual frames. Needs ~16-20 GB VRAM,
+                # comfortable on a 48 GB L40S / A6000.
                 predictions = model.inference_windowed(
                     images_dev,
-                    window_size=64,
+                    window_size=128,
                     overlap_size=0,
-                    overlap_keyframes=4,
+                    overlap_keyframes=8,
                     num_scale_frames=num_scale_frames,
-                    keyframe_interval=4,
+                    keyframe_interval=2,
                     output_device=torch.device("cpu"),
                 )
             else:
