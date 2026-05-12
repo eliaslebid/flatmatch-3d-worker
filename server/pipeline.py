@@ -66,6 +66,11 @@ def _get_model() -> torch.nn.Module:
     if _MODEL is None:
         args = InferenceArgs(model_path=CHECKPOINT_PATH)
         _MODEL = load_model(args, _DEVICE)
+        # On CUDA, cast the DINOv2-style aggregator to bf16 to drop a redundant
+        # fp32 master weight copy (~2-3 GB saved). Heads stay fp32 internally
+        # under autocast(enabled=False).
+        if _DEVICE.type == "cuda" and getattr(_MODEL, "aggregator", None) is not None:
+            _MODEL.aggregator = _MODEL.aggregator.to(dtype=torch.bfloat16)
     return _MODEL
 
 
@@ -74,7 +79,7 @@ def run_scan(
     output_glb: Path,
     *,
     fps: int = 5,
-    first_k: Optional[int] = 160,
+    first_k: Optional[int] = 80,
     conf_threshold: float = 1.5,
     max_points: int = 500_000,
     progress_path: Optional[Path] = None,
@@ -103,6 +108,8 @@ def run_scan(
         progress_mod.set_phase("loading_model")
         model = _get_model()
         images_dev = images.to(_DEVICE)
+        if _DEVICE.type == "cuda":
+            images_dev = images_dev.to(dtype=torch.bfloat16)
 
         # Streaming inference. On GPU use bf16 autocast (matches training);
         # on CPU autocast is a no-op via nullcontext.
