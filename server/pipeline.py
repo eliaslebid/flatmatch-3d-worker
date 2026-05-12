@@ -40,7 +40,7 @@ class InferenceArgs:
     """Minimal stand-in for the argparse Namespace that load_model expects."""
 
     model_path: str
-    mode: str = "streaming"
+    mode: str = "windowed" if torch.cuda.is_available() else "streaming"
     image_size: int = 518
     patch_size: int = 14
     enable_3d_rope: bool = True
@@ -79,7 +79,7 @@ def run_scan(
     output_glb: Path,
     *,
     fps: int = 5,
-    first_k: Optional[int] = 80,
+    first_k: Optional[int] = 300,
     conf_threshold: float = 1.5,
     max_points: int = 500_000,
     progress_path: Optional[Path] = None,
@@ -107,12 +107,14 @@ def run_scan(
 
         progress_mod.set_phase("loading_model")
         model = _get_model()
+        # Keep input images in fp32 — autocast handles bf16 internally. Casting
+        # the input to bf16 causes downstream `.numpy()` failures (numpy lacks
+        # a native bf16 dtype).
         images_dev = images.to(_DEVICE)
-        if _DEVICE.type == "cuda":
-            images_dev = images_dev.to(dtype=torch.bfloat16)
 
-        # Streaming inference. On GPU use bf16 autocast (matches training);
-        # on CPU autocast is a no-op via nullcontext.
+        # Streaming on CPU, windowed on GPU.
+        # Windowed lets us process arbitrarily long scans without growing the
+        # KV cache past the 320-frame trained range.
         progress_mod.set_phase("inferring", current=0, total=num_frames)
         if _DEVICE.type == "cuda":
             amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
@@ -124,12 +126,23 @@ def run_scan(
             keyframe_interval = 1
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
-            predictions = model.inference_streaming(
-                images_dev,
-                num_scale_frames=num_scale_frames,
-                keyframe_interval=keyframe_interval,
-                output_device=torch.device("cpu"),
-            )
+            if _DEVICE.type == "cuda" and hasattr(model, "inference_windowed"):
+                predictions = model.inference_windowed(
+                    images_dev,
+                    window_size=128,
+                    overlap_size=0,
+                    overlap_keyframes=8,
+                    num_scale_frames=num_scale_frames,
+                    keyframe_interval=keyframe_interval,
+                    output_device=torch.device("cpu"),
+                )
+            else:
+                predictions = model.inference_streaming(
+                    images_dev,
+                    num_scale_frames=num_scale_frames,
+                    keyframe_interval=keyframe_interval,
+                    output_device=torch.device("cpu"),
+                )
         t_infer = time.time() - t_infer
 
         progress_mod.set_phase("exporting")
