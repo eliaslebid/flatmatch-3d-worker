@@ -40,7 +40,9 @@ class InferenceArgs:
     """Minimal stand-in for the argparse Namespace that load_model expects."""
 
     model_path: str
-    mode: str = "windowed" if torch.cuda.is_available() else "streaming"
+    # Streaming is the paper-spec mode for ≤320 frame scans. We cap input
+    # at 300 frames upstream, so streaming is always fine.
+    mode: str = "streaming"
     image_size: int = 518
     patch_size: int = 14
     enable_3d_rope: bool = True
@@ -53,7 +55,11 @@ class InferenceArgs:
 
 CHECKPOINT_PATH = os.environ.get(
     "LINGBOT_CHECKPOINT",
-    str(REPO_ROOT / "checkpoints" / "lingbot-map.pt"),
+    # Prefer the long-sequence checkpoint when available — it's tuned for
+    # indoor walkthroughs and large-scale scenes per the model card.
+    str(REPO_ROOT / "checkpoints" / "lingbot-map-long.pt")
+    if (REPO_ROOT / "checkpoints" / "lingbot-map-long.pt").exists()
+    else str(REPO_ROOT / "checkpoints" / "lingbot-map.pt"),
 )
 
 # Lazy global model — first request pays the load cost (~6s), subsequent reuse.
@@ -115,41 +121,21 @@ def run_scan(
         # a native bf16 dtype).
         images_dev = images.to(_DEVICE)
 
-        # Streaming on CPU, windowed on GPU.
-        # Windowed lets us process arbitrarily long scans without growing the
-        # KV cache past the 320-frame trained range.
+        # Paper-spec streaming: every frame cached, 8 scale frames.
+        # On the 48 GB L40S this comfortably fits up to 300 frames in bf16.
         progress_mod.set_phase("inferring", current=0, total=num_frames)
         if _DEVICE.type == "cuda":
             amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
-            num_scale_frames = 4
-            keyframe_interval = 2
         else:
             amp_ctx = contextlib.nullcontext()
-            num_scale_frames = 8
-            keyframe_interval = 1
         t_infer = time.time()
         with torch.no_grad(), amp_ctx:
-            if _DEVICE.type == "cuda" and hasattr(model, "inference_windowed"):
-                # Paper-spec settings: window_size=128 + keyframe_interval=2.
-                # Each window holds 128 KV slots and covers
-                # (128 - 4) * 2 = 248 actual frames. Needs ~16-20 GB VRAM,
-                # comfortable on a 48 GB L40S / A6000.
-                predictions = model.inference_windowed(
-                    images_dev,
-                    window_size=128,
-                    overlap_size=0,
-                    overlap_keyframes=8,
-                    num_scale_frames=num_scale_frames,
-                    keyframe_interval=2,
-                    output_device=torch.device("cpu"),
-                )
-            else:
-                predictions = model.inference_streaming(
-                    images_dev,
-                    num_scale_frames=num_scale_frames,
-                    keyframe_interval=keyframe_interval,
-                    output_device=torch.device("cpu"),
-                )
+            predictions = model.inference_streaming(
+                images_dev,
+                num_scale_frames=8,
+                keyframe_interval=1,
+                output_device=torch.device("cpu"),
+            )
         t_infer = time.time() - t_infer
 
         progress_mod.set_phase("exporting")
@@ -173,12 +159,21 @@ def run_scan(
         pts = pts[mask]
         colors = colors[mask]
 
-        # Cap output at ~max_points so the mobile viewer stays responsive.
-        # 500k points -> ~8MB GLB, ~60fps on iPhone. Above 1M, three.js
-        # on-device gets sluggish.
+        # Voxel-grid downsample: keep one point per voxel. Preserves spatial
+        # structure way better than random subsampling (which leaves sparse
+        # areas sparse and over-represents dense regions). We auto-tune the
+        # voxel size to hit roughly max_points.
         if len(pts) > max_points:
-            rng = np.random.default_rng(seed=42)
-            idx = rng.choice(len(pts), size=max_points, replace=False)
+            lo = np.percentile(pts, 1, axis=0)
+            hi = np.percentile(pts, 99, axis=0)
+            scene_diag = float(np.linalg.norm(hi - lo))
+            voxel_size = max(scene_diag / 500.0, 1e-4)
+            for _ in range(6):
+                grid = np.floor(pts / voxel_size).astype(np.int64)
+                _, idx = np.unique(grid, axis=0, return_index=True)
+                if len(idx) <= max_points * 1.1:
+                    break
+                voxel_size *= 1.4
             idx.sort()
             pts = pts[idx]
             colors = colors[idx]
