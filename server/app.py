@@ -97,6 +97,30 @@ async def create_scan(background: BackgroundTasks, video: UploadFile = File(...)
     return JSONResponse(meta, status_code=202)
 
 
+@app.get("/scans")
+def list_scans() -> JSONResponse:
+    """List every scan, newest first. Includes status, timing, and result urls."""
+    items = []
+    for d in sorted(
+        (p for p in DATA_DIR.iterdir() if p.is_dir() and (p / "meta.json").exists()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            m = json.loads((d / "meta.json").read_text())
+        except Exception:
+            continue
+        m = dict(m)
+        sid = m["id"]
+        if m.get("status") == "done":
+            if (d / "scan.compressed.ply").exists() or (d / "scan.ply").exists():
+                m["ply_url"] = f"/scans/{sid}/scan.ply"
+            if (d / "scan.mp4").exists():
+                m["mp4_url"] = f"/scans/{sid}/scan.mp4"
+        items.append(m)
+    return JSONResponse(items)
+
+
 @app.get("/scans/{scan_id}")
 def get_scan(scan_id: str) -> JSONResponse:
     meta = _read_meta(scan_id)
