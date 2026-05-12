@@ -230,13 +230,14 @@ def run_scan(
 
         train_outputs = work_dir / "outputs"
         train_outputs.mkdir(parents=True, exist_ok=True)
+        # splatfacto (mcmc variant not in this nerfstudio version). Keep the
+        # scale-regularization flag — recommended for handheld smartphone capture.
         _stream_run(
-            ["ns-train", "splatfacto-mcmc",
+            ["ns-train", "splatfacto",
              "--data", str(processed),
              "--output-dir", str(train_outputs),
              "--max-num-iterations", str(max_iterations),
              "--pipeline.model.use-scale-regularization", "True",
-             "--pipeline.model.cull-alpha-thresh", "0.005",
              "--viewer.quit-on-train-completion", "True",
              "--vis", "tensorboard"],
             cwd=work_dir,
