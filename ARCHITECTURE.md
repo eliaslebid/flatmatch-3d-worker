@@ -1,98 +1,96 @@
 # Modula 3D scan — architecture & runbook
 
-Snapshot of what was built, what's running, and how to operate it. Written
-2026-05-12 at the end of a long debugging session — captures every gotcha we
-hit so the next person (or future you) doesn't relearn them.
+Snapshot of what was built, what's running, and how to operate it. Last
+updated 2026-05-12.
 
-## Shipped state (v0 "GLB beta")
+## Shipped state (v1 "Gaussian Splatting beta", Stack A)
 
-After a long debugging session ending 2026-05-12, the shipped configuration is:
+3D reconstruction is **3D Gaussian Splatting** via hloc + COLMAP +
+nerfstudio's `splatfacto`. Output is a compressed `.ply` rendered in the
+mobile app's WebView with custom first-person controls.
 
-- **Compute**: Mac Studio CPU (no rented GPU). Inference at ~3 s/frame,
-  total ~5–15 min per 30 s phone video. **No ongoing cost.**
-- **Output**: colored point-cloud GLB, voxel-grid downsampled to ~500k
-  points, rendered in-app via expo-gl + three.js.
-- **Quality**: fragmented but functional. The official MP4 renderer was
-  attempted and got close — see "Why no official MP4 renderer (yet)" below.
-- **Pod**: terminated. To resume cloud-GPU mode, follow the runbook below.
+- **Compute**: RunPod community-cloud **L40S 48 GB** at $0.79/hr.
+  Per-scan wallclock ~12–25 min, GPU cost ~$0.10–0.20.
+- **Output**:
+  - `scan.ply` — mkkellogg-native compressed PLY (~30–80 MB,
+    300k–500k gaussians after cleanup).
+  - `scan.original.ply` — pre-compression debug copy.
+  - `scan.mp4` — fallback flythrough from `ns-render interpolate`.
+- **Viewer**: `@mkkellogg/gaussian-splats-3d` in a `react-native-webview`
+  WebView, loaded from CDN via importmap. Custom controls drive the
+  camera directly (joystick + look + pinch-fly).
+- **Pod**: currently terminated (last pod `pqbblmkyk9kg41`). Recreate
+  via runbook below; setup is fully scripted in `setup_gsplat.sh`.
 
-## Pipeline at 30,000 ft (current GLB beta path)
+## Pipeline at 30,000 ft
 
 ```
 iPhone (Modula app, Profile → 3D Scan Beta)
    │  axios POST multipart/form-data, no body limit (LAN)
    ▼
-Mac Studio :8765
+Mac Studio :8765 (autossh -L 0.0.0.0:8765 → pod :8765)
+   ▼
+RunPod L40S pod :8765
    └── uvicorn server.app  →  FastAPI worker
-       ├── lingbot-map (cloned to ~/code/lingbot-map)
-       ├── lingbot-map-long.pt checkpoint (4.4 GB)
-       └── pipeline.py → trimesh GLB export
-```
-
-## Cloud-GPU pipeline (when needed, currently OFF)
-
-```
-iPhone → Mac :8765 (autossh -L) → RunPod pod :8765 (L40S 48 GB, $0.79/hr)
-   └── uvicorn server.app  →  FastAPI worker
-       └── (same pipeline.py, picks CUDA + bf16 automatically)
+       └── pipeline.py:
+           1. ffmpeg extract @ 2 fps + Laplacian blur filter (drop 20%)
+           2. hloc: SuperPoint features → custom sequential pairs →
+              SuperGlue matching → pycolmap incremental mapping (SfM)
+           3. ns-process-data images --skip-colmap (consumes hloc output)
+           4. ns-train splatfacto (--max-num-iterations 30000,
+              --pipeline.model.use-scale-regularization True)
+           5. ns-export gaussian-splat → raw .ply
+           6. splat-transform cleanup:
+                --filter-value opacity,gt,0.1
+                --filter-floaters 0.05,0.2,0.02
+           7. splat-transform compress → scan.compressed.ply
+           8. ns-render interpolate → scan.mp4 (fallback)
 ```
 
 Per scan:
-1. Phone records 10–60 s video (HEVC, up to ~100 MB).
-2. axios POSTs to Mac `:8765`. The Mac SSH-tunnels every byte to the pod's
-   `:8765`. No size cap on either hop.
-3. Worker accepts the upload, returns `{id, status:"queued"}`, queues a
-   FastAPI BackgroundTask. Per-process lock serializes scans.
-4. Worker pipeline (see [`server/pipeline.py`](server/pipeline.py)):
-   - `load_images` extracts frames from MP4 at 5 fps (cap `first_k=300`).
-   - `load_model` once, lazy global, aggregator cast to bf16 on CUDA.
-   - `model.inference_streaming(num_scale_frames=8, keyframe_interval=1)`
-     under bf16 autocast.
-   - `save_predictions_npz` writes per-frame `.npz` to `predictions/`.
-   - `rgbd_render.OfflinePipeline` → MP4 flythrough at `scan.mp4`.
-5. Mobile polls `GET /scans/{id}`. When `status:"done"`, response contains
-   `mp4_url`. Mobile renders the video in a `WebView` (HTML5 `<video>`).
-6. `expo-notifications` fires a local notification when status flips to done.
+1. Phone records 10–60 s video (HEVC, up to ~150 MB).
+2. axios POSTs to Mac `:8765`. The Mac SSH-tunnels every byte to the pod.
+   No size cap on either hop.
+3. Worker accepts, returns `{id, status:"queued"}`, queues a FastAPI
+   `BackgroundTask`. Per-process lock serializes scans.
+4. Mobile polls `GET /scans/{id}`. When `status:"done"`, response
+   contains `ply_url` (and `mp4_url` as fallback).
+5. `expo-notifications` fires a local notification on completion.
 
-## What's running right now
+## What's running (and how to find it)
 
-| Component | Where | How to find it |
+| Component | Where | How to find / start |
 |---|---|---|
-| RunPod pod | `xgiotw11pmmf8e`, L40S, Taiwan, $0.79/hr | `curl -H "Authorization: Bearer <KEY>" https://rest.runpod.io/v1/pods` |
-| Pod SSH | `root@193.183.22.51:1883`, key `~/.ssh/id_ed25519` | `cat ~/.ssh/id_ed25519.pub` is in pod's `PUBLIC_KEY` env |
-| Pod worker | `uvicorn server.app:app --host 0.0.0.0 --port 8765` in `/workspace/lingbot-map` | `ssh ... 'pgrep -af uvicorn'` |
-| Mac tunnel | `autossh -M 0 -N -L 0.0.0.0:8765:localhost:8765 -p 1883 -i ~/.ssh/id_ed25519 root@193.183.22.51` | `pgrep -af autossh` |
+| RunPod pod | _terminated_; recreate as `modula-gsplat-worker`, L40S, $0.79/hr | `curl -H "Authorization: Bearer <KEY>" https://rest.runpod.io/v1/pods` |
+| Pod SSH | port mapped from `22/tcp` to a public port | RunPod GraphQL `runtime{ports{...}}` |
+| Pod worker | `uvicorn server.app:app --host 0.0.0.0 --port 8765` in `/workspace` | `ssh ... 'pgrep -af uvicorn'` |
+| Mac tunnel | `autossh -M 0 -N -L 0.0.0.0:8765:localhost:8765 -p <SSH_PORT> -i ~/.ssh/id_ed25519 root@<SSH_IP>` | `pgrep -af autossh` |
 | Mobile config | `apps/mobile/.env`: `EXPO_PUBLIC_SCAN_WORKER_URL=http://192.168.31.99:8765` | `cat apps/mobile/.env \| grep SCAN` |
 | Worker source | https://github.com/eliaslebid/flatmatch-3d-worker | this repo |
+| Scan history | survives app reinstall — `GET /scans` lists everything in `/workspace/scans/` | open Profile → 3D Scan Beta → "Минулі сканування" |
 
 ## Operating the system
 
-### Start everything from cold
+### Start everything from cold (post-termination)
 
 ```bash
-# 1. Create pod (one-time per session — pod is ephemeral, model on container disk)
+# 1. Create pod (one-time per session — container disk is ephemeral; attach
+#    a network volume at /workspace for persistence if needed)
 curl -X POST https://rest.runpod.io/v1/pods \
   -H "Authorization: Bearer <RUNPOD_KEY>" -H "Content-Type: application/json" \
-  -d '{"name":"modula-3d-worker","imageName":"runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04","gpuTypeIds":["NVIDIA L40S"],"gpuCount":1,"containerDiskInGb":50,"ports":["8765/http","22/tcp"],"interruptible":false,"cloudType":"COMMUNITY"}'
+  -d '{"name":"modula-gsplat-worker","imageName":"runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04","gpuTypeIds":["NVIDIA L40S"],"gpuCount":1,"containerDiskInGb":80,"ports":["8765/http","22/tcp"],"interruptible":false,"cloudType":"COMMUNITY"}'
 
-# 2. Wait for SSH port mapping (GraphQL `runtime{ports{...}}` until publicPort != null)
+# 2. Wait for SSH port mapping (GraphQL until publicPort != null)
 
-# 3. SSH in, clone worker repo, run setup + renderer upgrade
+# 3. SSH in, clone worker repo, run setup
 ssh -p <SSH_PORT> root@<SSH_IP>
 cd /workspace
 git clone https://github.com/eliaslebid/flatmatch-3d-worker.git
-cd flatmatch-3d-worker && bash setup.sh
-# Then run the renderer-extras install (manual — see "Pod setup gotchas")
-rm -rf /usr/lib/python3/dist-packages/blinker*
-pip install --quiet open3d pyyaml onnxruntime-gpu
-pip install --quiet --upgrade torch==2.8.0 torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install --quiet --index-url https://pypi.org/simple kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html
-cd /workspace/lingbot-map/demo_render/render_cuda_ext && python setup.py build_ext --inplace
-# Also download the long-sequence checkpoint
-cd /workspace/lingbot-map && python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('robbyant/lingbot-map', 'lingbot-map-long.pt', local_dir='checkpoints')"
+cd flatmatch-3d-worker && bash setup_gsplat.sh
+# ~25–35 min total (tinycudann + gsplat CUDA compile)
 
-# 4. Start the worker (must use setsid — see "Why setsid")
-ssh -p <SSH_PORT> root@<SSH_IP> 'cd /workspace/lingbot-map && setsid -f uvicorn server.app:app --host 0.0.0.0 --port 8765 > /workspace/worker.log 2>&1 < /dev/null'
+# 4. Start the worker (must use setsid — see gotchas)
+ssh -p <SSH_PORT> root@<SSH_IP> 'cd /workspace && setsid -f uvicorn server.app:app --host 0.0.0.0 --port 8765 > /workspace/worker.log 2>&1 < /dev/null'
 
 # 5. Start Mac autossh tunnel
 AUTOSSH_GATETIME=0 nohup autossh -M 0 -N \
@@ -104,224 +102,211 @@ AUTOSSH_GATETIME=0 nohup autossh -M 0 -N \
   root@<SSH_IP> > /tmp/scan-tunnel.log 2>&1 &
 disown
 
-# 6. Update apps/mobile/.env if SSH_IP/SSH_PORT changed (it doesn't; URL is Mac's LAN IP)
-
-# 7. Rebuild iOS app only if .env changed:
-#    APP_ENV=production pnpm exec expo run:ios --device --configuration Release
+# 6. apps/mobile/.env stays pointed at the Mac's LAN IP — no rebuild needed
+#    unless the LAN IP itself changed.
 ```
 
 ### Stop everything
 
 ```bash
-# Stop tunnel
 pkill -f autossh
-
-# Stop pod (kills billing)
-curl -X DELETE -H "Authorization: Bearer <RUNPOD_KEY>" https://rest.runpod.io/v1/pods/<POD_ID>
+curl -X DELETE -H "Authorization: Bearer <RUNPOD_KEY>" \
+     https://rest.runpod.io/v1/pods/<POD_ID>
 ```
 
-### Cancel in-flight scans
+### Cancel in-flight scans / restart worker
 
 ```bash
-ssh -p <SSH_PORT> root@<SSH_IP> 'python3 -c "
+ssh -p <SSH_PORT> root@<SSH_IP> '
+  python3 -c "
 import json, datetime, glob
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-for f in glob.glob(\"/workspace/lingbot-map/server/data/*/meta.json\"):
+for f in glob.glob(\"/workspace/scans/*/meta.json\"):
     d = json.load(open(f))
     if d.get(\"status\") in (\"processing\", \"queued\"):
         d[\"status\"] = \"failed\"; d[\"error\"] = \"Cancelled\"; d[\"finished_at\"] = now
         json.dump(d, open(f, \"w\"), indent=2)
         print(\"cancelled\", d.get(\"id\"))
-"; pkill -9 -f uvicorn; sleep 2; cd /workspace/lingbot-map && setsid -f uvicorn server.app:app --host 0.0.0.0 --port 8765 > /workspace/worker.log 2>&1 < /dev/null'
+"
+  pkill -9 -f uvicorn; sleep 2
+  cd /workspace && setsid -f uvicorn server.app:app --host 0.0.0.0 --port 8765 > /workspace/worker.log 2>&1 < /dev/null
+'
 ```
 
-### Tail the worker log live
+### Tail logs
 
 ```bash
 ssh -p <SSH_PORT> root@<SSH_IP> 'tail -f /workspace/worker.log'
 ```
 
-### Verify everything works
+### Verify end-to-end
 
 ```bash
-# From Mac, after tunnel + worker are up
-curl -s http://192.168.31.99:8765/health
-# → {"ok":true,"queue_locked":false}
-
-# End-to-end test upload
+curl -s http://192.168.31.99:8765/health           # {"ok":true,...}
 curl -X POST -F "video=@/tmp/test.mp4" http://192.168.31.99:8765/scans
-# Returns {id, status:"queued"}, then poll /scans/{id}.
+curl -s http://192.168.31.99:8765/scans            # list
 ```
 
 ## Gotchas we hit (in order of pain)
 
+### gsplat / nerfstudio install
+
+1. **Stock `gsplat` PyPI wheel ships without CUDA kernels for our env.**
+   Splatfacto fails at runtime with `AttributeError: 'NoneType' object has no
+   attribute 'CameraModelType'`. Fix: reinstall from source with
+   `CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=8.9 pip install
+   --no-build-isolation gsplat`. Captured in `setup_gsplat.sh` step 6.
+
+2. **hloc doesn't bundle SuperGluePretrainedNetwork.** The SuperGlue matcher
+   imports it as a top-level module. Fix: clone
+   `magicleap/SuperGluePretrainedNetwork` into hloc's `third_party/` and
+   symlink to `site-packages`. Captured in setup step 7.
+
+3. **`splatfacto-mcmc` is not in nerfstudio's installed model list** despite
+   docs implying it is. Use plain `splatfacto` with
+   `--pipeline.model.use-scale-regularization True` instead — same paper, no
+   missing model error.
+
+4. **PyTorch ≥2.6 flips `torch.load(weights_only=True)` default**, breaking
+   nerfstudio checkpoint loading at `ns-export` / `ns-render`. Fix: write
+   `/usr/local/lib/python3.11/sitecustomize.py` that monkey-patches
+   `torch.load`. Captured in setup step 9.
+
+5. **Ubuntu's apt nodejs is v12, too old for `@playcanvas/splat-transform`
+   (needs ≥18).** apt's nodesource setup script fails on 22.04. Fix: install
+   Node 20 from the official tarball. Captured in setup step 8.
+
+6. **`splat-transform --filter-sphere` rejects float values < 1** — bug in
+   the package's `parseNumber`. Pivoted to `--filter-value opacity,gt,0.1`
+   and `--filter-floaters 0.05,0.2,0.02` (voxel-based) for floater cleanup.
+
+7. **mkkellogg/gaussian-splats-3d 0.4.7 doesn't support SOG or SPZ formats**
+   despite being mentioned in some PRs — only `.ply` and
+   `.compressed.ply`. We use the latter (~3× smaller than raw .ply, with
+   identical visual quality at our point counts).
+
+### Pipeline / SfM
+
+8. **`pairs_from_sequential` missing in installed hloc version.** Wrote an
+   inline sequential pair generator: each frame paired with next 10 + sparse
+   loop-closure pairs every `n/20` frames.
+
+9. **GLOMAP's DB schema is incompatible with hloc/pycolmap output**, so
+   feeding hloc's matches into GLOMAP fails at the mapper step. Dropped
+   GLOMAP entirely; use `hloc.reconstruction.main()` which calls pycolmap's
+   incremental mapper directly. Quality difference is invisible at our
+   scale (300–1500 input matches).
+
+10. **hloc writes COLMAP `cameras.bin/images.bin/points3D.bin` directly to
+    `sfm/`, NOT to `sfm/sparse/0/`.** Copy logic must handle both shapes.
+
+11. **`ns-process-data images --colmap-model-path` needs a path RELATIVE to
+    the data directory.** Absolute paths silently produce empty results.
+
+12. **`ns-train` progress line is a printed table, not tqdm.** Regex parser:
+    `re.compile(r"^\s*(\d+)\s+\((\d+(?:\.\d+)?)%\)")` after stripping ANSI
+    sequences. tqdm-style regex matches zero lines.
+
 ### Networking
 
-1. **RunPod's `*.proxy.runpod.net` URL silently truncates POST bodies at ~5 MB.**
-   Real phone videos die mid-upload. Direct TCP (port-mapped 8765) is the only
-   reliable path, but it's plain HTTP — requires either ATS exemption (we use
-   the Mac as a LAN frontend) or a separate HTTPS terminator (Caddy/Cloudflare).
+13. **RunPod's `*.proxy.runpod.net` URL silently truncates POST bodies at
+    ~5 MB.** Phone videos die mid-upload. Direct port-mapped TCP is the
+    only reliable path.
 
-2. **Cloudflare quick-tunnels (`*.trycloudflare.com`) are blocked from at
-   least one of our networks** (DNS resolves, TCP connect to those specific
-   Cloudflare IPs hangs). Mac couldn't reach the tunnel; the pod could.
+14. **Cloudflare quick-tunnels (`*.trycloudflare.com`) are blocked from at
+    least one of our networks.** DNS resolves; TCP connect hangs.
 
-3. **localhost.run tunnels work but truncate large POSTs mid-stream too** —
-   30 MB completed from the Mac, but the phone got an "moov atom not found"
-   from a truncated upload. Suspect SSH tunnel back-pressure.
+15. **localhost.run tunnels truncate large POSTs mid-stream too** (we saw
+    "moov atom not found" from a truncated 30 MB upload).
 
-4. **Mac as relay is the cleanest setup.** Phone → Mac LAN (no body cap, no
-   ATS issues, WPA-encrypted at the WiFi layer) → SSH tunnel to pod.
-
-5. **iOS App Transport Security blocks plain HTTP to public IPs even with
-   `NSAllowsLocalNetworking=true`** — that key only covers RFC1918 LAN IPs.
-
-6. **iOS Local Network permission is silent.** Without
-   `NSLocalNetworkUsageDescription` in Info.plist, iOS denies connections to
-   `192.168.x.x` without ever prompting.
+16. **Mac LAN relay is the only setup that doesn't break.** Phone → Mac LAN
+    (no body cap, no ATS issues) → autossh tunnel to pod.
 
 ### iOS
 
-7. **`expo-notifications` requires `aps-environment` entitlement, which a
-   free Apple Developer Team can't sign.** Strip from `*.entitlements` to
-   install on personal-team builds. Local notifications still work.
+17. **`expo-notifications` requires `aps-environment` entitlement, which a
+    free Apple Developer Team can't sign.** Strip from `*.entitlements` —
+    local notifications still work without it.
 
-8. **`ENABLE_USER_SCRIPT_SANDBOXING=YES` (Xcode 15+ default) breaks CocoaPods
-   builds** and lies about it ("The sandbox is not in sync with the
-   Podfile.lock"). Set to `NO` at project level.
+18. **`ENABLE_USER_SCRIPT_SANDBOXING=YES` (Xcode 15+ default) breaks
+    CocoaPods builds** and lies about Podfile.lock sync. Set to `NO` in the
+    pbxproj at project level.
 
-9. **`0xe800801f Attempted to install a Beta profile without the proper
-   entitlement` = wrong profile type, not wrong device OS.** Switching from
-   manual AppStore signing to "Automatically manage signing" fixes it.
+19. **`0xe800801f Attempted to install a Beta profile…` is actually a
+    wrong-profile-type error** (AppStore distribution vs Development), not
+    a beta-OS error. Switch to "Automatically manage signing".
 
-10. **`.env` (and any `EXPO_PUBLIC_*`) is baked into the bundle at Metro
-    start time.** Reload-only (`r`) does NOT pick up `.env` changes. Need a
-    full Metro restart, or for `--configuration Release` builds, a full
-    `expo run:ios` rebuild.
+20. **`.env` and any `EXPO_PUBLIC_*` is baked at Metro start time.** Reload
+    (`r`) does NOT pick up changes. Full rebuild required for release.
 
-11. **Gallery picker is slow because of HEVC → sandbox copy/transcode.**
-    Recorded videos upload instantly; gallery picks have a 5–60s
-    invisible "preparing" phase before axios sees any bytes.
+21. **Gallery picker has invisible 5–60 s HEVC transcode** before axios
+    sees any bytes. Recorded videos upload instantly; picked ones look
+    "frozen" for a while.
 
-### Pod setup
+### Pod / runtime
 
-12. **`pip install` on the pod fights `distutils`-installed `blinker`.**
-    Remove `/usr/lib/python3/dist-packages/blinker*` first.
+22. **Ubuntu 22.04's `distutils`-installed `blinker` blocks pip upgrades.**
+    Remove `/usr/lib/python3/dist-packages/blinker*` first. Captured in
+    setup step 2.
 
-13. **`pip install -e ".[render]"` doesn't work** — the `render` extra
-    isn't declared in `pyproject.toml`. Install `open3d pyyaml
-    onnxruntime-gpu` manually.
+23. **`nohup … &` inside `ssh` dies on SSH disconnect** when the child
+    inherits SSH's controlling terminal. Use `setsid -f` instead.
 
-14. **Adding `demo_render/` to `sys.path` shadows the top-level `demo.py`**
-    with `demo_render/demo.py` (different `load_images` signature, returns
-    2 values instead of 3). Fix: import `demo` first (let it cache in
-    `sys.modules`), THEN add `demo_render/` to `sys.path` lazily, only
-    when calling the renderer.
+24. **WebView shows "100% 100%" blank on the 2nd visit** to the same scan
+    because mkkellogg's worker state persists across navigations. Fix:
+    `key={url}`, `incognito`, `cacheEnabled={false}`, and
+    `progressiveLoad: false`. See `apps/mobile/app/scan/[id].tsx`.
 
-15. **`nohup ... &` inside `ssh` dies on SSH disconnect** if the spawned
-    process inherits SSH's controlling terminal. Use `setsid -f` instead.
+25. **Importing `splat-viewer.html.ts` breaks Metro module resolution** —
+    the `.html.` infix in the name confuses the resolver. Renamed to
+    `splatViewerHtml.ts`.
 
-16. **Renderer's default `num_workers=16` spawns multiprocessing children
-    that kill the FastAPI uvicorn parent** inside BackgroundTasks. Force
-    `cfg.num_workers = 1` for serial rendering.
-
-### Model / inference
-
-17. **Hardcoded `_DEVICE = torch.device("cpu")`** in `pipeline.py` made
-    everything run on CPU even on a $0.79/hr 4090 box for an hour. Always
-    `torch.device("cuda" if torch.cuda.is_available() else "cpu")`.
-
-18. **Lingbot-map needs `torch>=2.5`** for `torch.nn.attention.flex_attention`.
-    PyTorch base image with 2.4 gives `ModuleNotFoundError`. Upgrade to 2.8 +
-    cu128 wheels for the official renderer (Kaolin needs it).
-
-19. **24 GB VRAM is not enough** for paper-spec settings (`window_size=128`,
-    `keyframe_interval=2`, `num_scale_frames=8`). 4090 OOMs at ~22.5 GB. The
-    L40S 48 GB handles it. The paper benchmarks on A100.
-
-20. **bf16 input tensor breaks downstream `.numpy()`** (numpy has no bf16
-    dtype) during GLB/MP4 export. Cast model weights to bf16, but keep
-    input images in fp32; let autocast handle bf16 math internally.
-
-21. **`lingbot-map.pt` ("balanced") vs `lingbot-map-long.pt` ("long-sequence,
-    recommended for indoor")** produce very different quality. Use long.
-
-22. **Random downsampling of per-pixel point cloud throws away spatial
-    structure.** Voxel-grid downsampling preserves dense surfaces. Even
-    better: skip it entirely and use the official `rgbd_render` CUDA
-    voxelizer, which produces the demo-quality MP4s.
-
-23. **`windowed` mode is "for >3000 frames" per README**, not >320. Using it
-    for short scans introduces window-boundary discontinuities and degrades
-    quality. Use `streaming` mode for any scan ≤320 frames.
-
-24. **Quality is bounded by recording technique.** Feed-forward 3D models
-    need multi-view triangulation; handheld pans without revisiting surfaces
-    give the model very little parallax. Slow, deliberate walks revisiting
-    feature-dense areas yield dramatically better output.
-
-## Pipeline knobs (server/pipeline.py)
+## Pipeline knobs (`server/pipeline.py`)
 
 | Knob | Default | Effect |
 |---|---|---|
-| `fps` | 5 | Frame extraction rate from input video |
-| `first_k` | 300 | Hard cap on extracted frames (60 s at 5 fps) |
-| `num_scale_frames` | 8 | Paper default; bidirectional scale frames |
-| `keyframe_interval` | 1 | Cache every frame (paper default for ≤320 frames) |
-| `cfg.num_workers` | 1 | Force serial render — DO NOT raise inside FastAPI |
-| `cfg.preprocess.mask_sky` | false | Sky masking off for indoor; on for outdoor |
-
-To experiment with higher quality, edit `_render_to_mp4()` in `pipeline.py`
-and load `outdoor_large.yaml` or `indoor_overview.yaml` instead of
-`indoor.yaml`. The renderer respects all the YAML camera/scene knobs.
+| `fps` (ffmpeg) | 2 | Frame extraction rate |
+| Laplacian blur drop | 20% | Drop worst 20% frames by Laplacian variance |
+| `--max-num-iterations` | 30000 | splatfacto training steps (~10–15 min on L40S) |
+| `--pipeline.model.use-scale-regularization` | True | Limits very thin/elongated gaussians (reduces floaters) |
+| `splat-transform --filter-value opacity,gt,0.1` | 0.1 | Drop low-opacity gaussians (~3–5%) |
+| `splat-transform --filter-floaters 0.05,0.2,0.02` | as shown | Voxel-occupancy floater removal |
 
 ## Cost notes
 
-- L40S 48 GB on RunPod community: $0.79/hr (~$19/day if left running).
-- Container disk loses model on pod termination; first scan on a fresh pod
-  pays ~5 min of setup (model re-download + extension rebuild).
-- For "always-on" beta usage, attach a **50 GB network volume** at
-  `/workspace` so the model + Python env persist across pod stops.
+- L40S 48 GB community: $0.79/hr → ~$0.15 per scan, ~$19/day if idle.
+- Container disk is wiped on termination. For "always-on" beta usage,
+  attach a 50 GB network volume at `/workspace`.
 
-## Why no official MP4 renderer (yet)
+## Mobile viewer (`apps/mobile/components/scan/splatViewerHtml.ts`)
 
-We got the official `demo_render/rgbd_render` pipeline 95% of the way
-working on the L40S pod:
+WebView-based first-person viewer:
 
-- ✅ Upgraded torch 2.4 → 2.8.0+cu128 (Kaolin's required version)
-- ✅ Installed Kaolin 0.18.0 for torch 2.8/cu128 (after fighting blinker
-  distutils conflicts)
-- ✅ Built `render_cuda_ext` (`voxel_morton_ext`, `frustum_cull_ext`)
-- ✅ Pipeline runs through inference → NPZ save → SceneBuilder → unproject
-- ❌ **Silent SIGSEGV inside `OctreeSPC.build`** (the next step after unproject)
+- Left third of the screen = virtual joystick (forward/back/strafe).
+- Right two thirds = drag to look (yaw + pitch).
+- Pinch with two fingers on the right = vertical fly.
+- "↺" button recenters at the scene's median position.
+- `cameraUp = [0, -1, 0]` (mkkellogg / nerfstudio convention).
+- In-page status overlay catches `window.error` /
+  `unhandledrejection` for on-device debugging without a desktop.
 
-The crash happens with **no Python traceback even with `faulthandler.enable`**
-— it's a hard native fault in Kaolin's SPC code. Kaolin's basic SPC test
-(`unbatched_points_to_octree`) works fine in isolation, so the bug is
-specific to how rgbd_render uses it.
+## Scan history (survives app reinstall)
 
-Subprocess isolation (`server/render_runner.py` in earlier commits) was
-added so the segfault doesn't kill the FastAPI worker — but we couldn't
-get past the segfault itself.
-
-Next time, two paths to try:
-1. Rebuild Kaolin from source against our exact torch/CUDA combo (could be
-   a kernel ABI mismatch with the prebuilt wheel).
-2. Skip Kaolin entirely: rewrite voxelization with `open3d` + GPU CUDA
-   reduction. Or pivot to **Gaussian Splatting** (`nerfstudio` /
-   `splatfacto`), which gives 9/10 quality vs lingbot-map's 3/10 on
-   handheld video.
+- `GET /scans` lists every scan dir under `/workspace/scans/`.
+- `apps/mobile/app/scan/history.tsx` calls it, prepopulates the Zustand
+  store, navigates to `/scan/[id]`.
+- Independent of MMKV state, so a fresh app install still sees old scans.
 
 ## What's NOT done yet
 
-- **Quality is fragmented point cloud, not the photographable demo output.**
-  The fundamental fix is gaussian splatting — see "Why no official MP4
-  renderer".
-- **Mac must be awake on the same WiFi as the phone.** Cellular / hotel
-  WiFi scans need either a TLS-fronted cloud endpoint (Caddy + a custom
-  domain) or a Tailscale exit.
-- **No queue UX in mobile** — multiple uploads serialize silently.
-- **No network volume on the pod** — every pod restart wipes the model.
+- **No queue UX in mobile** — multiple uploads serialize silently on the
+  worker side.
+- **No network volume** — every pod recreation re-pays the ~30 min setup.
+- **Floaters remain visible** in low-texture areas (large white walls)
+  even after cleanup. Better recording technique (slow walk, revisit
+  surfaces) helps more than any post-filter.
+- **Mac must be on the same WiFi as the phone.** Cellular scans need a
+  TLS-fronted endpoint (Caddy + domain) or a Tailscale exit.
 
 ## Mobile config (snapshot)
 
@@ -332,6 +317,6 @@ Next time, two paths to try:
   - `NSAppTransportSecurity.NSAllowsLocalNetworking=true`
   - `NSLocalNetworkUsageDescription="…"`
 - `apps/mobile/ios/HotlineFlat/HotlineFlat.entitlements`: empty `<dict>`
-  (no `aps-environment`, so a free Apple Dev Team can sign).
+  (no `aps-environment`, free Apple Dev Team-friendly).
 - `apps/mobile/ios/HotlineFlat.xcodeproj/project.pbxproj`:
   `ENABLE_USER_SCRIPT_SANDBOXING=NO` at project level.
