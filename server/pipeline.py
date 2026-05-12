@@ -209,12 +209,13 @@ def run_scan(
         for f in src_sparse.glob("*"):
             shutil.copy(f, colmap_out / f.name)
         # Generate transforms.json
+        # --colmap-model-path is interpreted relative to --output-dir.
         _stream_run(
             ["ns-process-data", "images",
              "--data", str(images_out),
              "--output-dir", str(processed),
              "--skip-colmap",
-             "--colmap-model-path", str(colmap_out)],
+             "--colmap-model-path", "colmap/sparse/0"],
             log_path=log_path,
         )
 
