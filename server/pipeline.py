@@ -1,14 +1,12 @@
-"""Run lingbot-map inference and render the official rgbd_render MP4 flythrough.
+"""Run lingbot-map inference and export a colored point-cloud GLB.
 
-This is the same pipeline that produces the demo videos on the repo:
-  video -> frames -> model.inference_streaming -> NPZ -> SceneBuilder
-       -> CUDA voxelization (NVIDIA Kaolin) -> OfflinePipeline -> MP4
+This is the v0 "GLB beta" path: model inference + depth unprojection +
+voxel-grid downsampling + trimesh export. Works on either CPU or CUDA.
 
-Requires the pod to have:
-  - torch 2.8.0 + cu128 wheels
-  - lingbot-map[vis,render] (open3d, pyyaml, viser, trimesh)
-  - kaolin built for torch 2.8 / cu128
-  - demo_render/render_cuda_ext built in-place (voxel_morton_ext + frustum_cull_ext)
+The official rgbd_render MP4 pipeline (in demo_render/) was attempted but
+silently segfaults inside Kaolin's octree builder on our pod env. Tracked
+for v2 along with a Gaussian Splatting alternative — see
+https://github.com/eliaslebid/flatmatch-3d-worker/blob/main/ARCHITECTURE.md
 """
 
 from __future__ import annotations
@@ -21,24 +19,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
+import trimesh
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEMO_RENDER_DIR = REPO_ROOT / "demo_render"
-RENDER_EXT_DIR = DEMO_RENDER_DIR / "render_cuda_ext"
-
-# IMPORTANT: only add REPO_ROOT to sys.path here. Adding demo_render/ globally
-# would shadow the top-level demo.py with demo_render/demo.py (different
-# load_images signature). We import rgbd_render lazily via importlib in
-# _render_to_mp4().
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from demo import (  # noqa: E402  (demo.py is the script in the repo root)
+from demo import (  # noqa: E402
     load_images,
     load_model,
     postprocess,
     prepare_for_visualization,
+)
+from lingbot_map.utils.geometry import (  # noqa: E402
+    unproject_depth_map_to_point_map,
 )
 from server import progress as progress_mod  # noqa: E402
 
@@ -66,8 +62,6 @@ CHECKPOINT_PATH = os.environ.get(
     else str(REPO_ROOT / "checkpoints" / "lingbot-map.pt"),
 )
 
-INDOOR_YAML = REPO_ROOT / "demo_render" / "config" / "indoor.yaml"
-
 _MODEL = None
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -82,66 +76,20 @@ def _get_model() -> torch.nn.Module:
     return _MODEL
 
 
-def _save_predictions_npz(predictions, npz_dir: Path) -> str:
-    """Wrapper around batch_demo.save_predictions_npz that takes a Path."""
-    from demo_render.batch_demo import save_predictions_npz
-
-    return save_predictions_npz(predictions, str(npz_dir))
-
-
-def _render_to_mp4(npz_dir: Path, output_mp4: Path) -> None:
-    """Run the official rgbd_render pipeline as a SUBPROCESS.
-
-    Kaolin / Open3D / the custom CUDA extensions can segfault the host
-    process; running rendering out-of-process means a crash only marks the
-    scan failed instead of killing the uvicorn worker for everyone.
-    """
-    import subprocess
-
-    log_path = output_mp4.parent / "render.log"
-    cmd = [
-        sys.executable,
-        "-m",
-        "server.render_runner",
-        str(npz_dir),
-        str(output_mp4),
-    ]
-    with log_path.open("w") as logf:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(REPO_ROOT),
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-    if proc.returncode != 0:
-        tail = ""
-        try:
-            tail = "\n".join(log_path.read_text().splitlines()[-30:])
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"render_runner exited {proc.returncode}\n--- render.log tail ---\n{tail}"
-        )
-
-
 def run_scan(
     video_path: Path,
-    output_mp4: Path,
+    output_glb: Path,
     *,
     fps: int = 5,
     first_k: Optional[int] = 300,
+    conf_threshold: float = 1.5,
+    max_points: int = 500_000,
     progress_path: Optional[Path] = None,
 ) -> dict:
-    """Run inference on a video and render the official MP4 flythrough.
-
-    Returns metadata about the scan: timing, frame count, mp4 size.
-    """
     if _DEVICE.type == "cuda":
         torch.cuda.empty_cache()
     t0 = time.time()
-    output_mp4.parent.mkdir(parents=True, exist_ok=True)
-    npz_dir = output_mp4.parent / "predictions"
+    output_glb.parent.mkdir(parents=True, exist_ok=True)
     progress_mod.set_path(progress_path)
 
     try:
@@ -180,16 +128,48 @@ def run_scan(
         progress_mod.set_phase("exporting")
         predictions, images_cpu = postprocess(predictions, images_dev)
         vis = prepare_for_visualization(predictions, images_cpu)
-        _save_predictions_npz(vis, npz_dir)
 
-        progress_mod.set_phase("rendering")
-        _render_to_mp4(npz_dir, output_mp4)
+        depth = vis["depth"]
+        depth_conf = vis["depth_conf"]
+        extrinsic = vis["extrinsic"]
+        intrinsic = vis["intrinsic"]
+        imgs = vis["images"]
+
+        world = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
+        pts = world.reshape(-1, 3)
+        colors = imgs.transpose(0, 2, 3, 1).reshape(-1, 3)
+        conf = depth_conf.reshape(-1)
+
+        mask = np.isfinite(pts).all(axis=1) & (conf >= conf_threshold)
+        pts = pts[mask]
+        colors = colors[mask]
+
+        # Voxel-grid downsample preserves spatial structure better than random.
+        if len(pts) > max_points:
+            lo = np.percentile(pts, 1, axis=0)
+            hi = np.percentile(pts, 99, axis=0)
+            scene_diag = float(np.linalg.norm(hi - lo))
+            voxel_size = max(scene_diag / 500.0, 1e-4)
+            for _ in range(6):
+                grid = np.floor(pts / voxel_size).astype(np.int64)
+                _, idx = np.unique(grid, axis=0, return_index=True)
+                if len(idx) <= max_points * 1.1:
+                    break
+                voxel_size *= 1.4
+            idx.sort()
+            pts = pts[idx]
+            colors = colors[idx]
+
+        colors_u8 = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
+        cloud = trimesh.PointCloud(vertices=pts.astype(np.float32), colors=colors_u8)
+        trimesh.Scene([cloud]).export(str(output_glb), file_type="glb")
 
         return {
             "frames": num_frames,
+            "points": int(len(pts)),
             "inference_seconds": round(t_infer, 1),
             "total_seconds": round(time.time() - t0, 1),
-            "mp4_bytes": output_mp4.stat().st_size if output_mp4.exists() else 0,
+            "glb_bytes": output_glb.stat().st_size,
         }
     finally:
         progress_mod.set_path(None)

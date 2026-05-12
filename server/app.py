@@ -64,9 +64,9 @@ def _process(scan_id: str) -> None:
         _write_meta(scan_id, meta)
         try:
             video = _scan_dir(scan_id) / "input.mp4"
-            mp4 = _scan_dir(scan_id) / "scan.mp4"
+            glb = _scan_dir(scan_id) / "scan.glb"
             progress = _scan_dir(scan_id) / "progress.json"
-            result = run_scan(video, mp4, progress_path=progress)
+            result = run_scan(video, glb, progress_path=progress)
             meta["status"] = "done"
             meta["finished_at"] = _now()
             meta["result"] = result
