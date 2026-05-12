@@ -268,20 +268,24 @@ def run_scan(
         if default_ply.exists() and not ply_path.exists():
             default_ply.rename(ply_path)
 
-        # 6. Compress to SPZ (Niantic, 10× smaller than PLY, supported by
-        # mkkellogg/gaussian-splats-3d which is the mobile WebView viewer).
+        # 6. Compress the .ply in place (4-5× smaller, ~30 MB typical).
+        # splat-transform produces a .compressed.ply that mkkellogg's
+        # GaussianSplats3D viewer loads natively as a regular .ply URL.
         progress_mod.set_phase("compressing")
-        spz_path = scan_dir / "scan.spz"
         if ply_path.exists():
             try:
+                compressed = scan_dir / "scan.compressed.ply"
                 _stream_run(
-                    ["splat-transform", str(ply_path), str(spz_path)],
+                    ["splat-transform", str(ply_path), str(compressed)],
                     log_path=log_path,
                 )
+                if compressed.exists():
+                    # Keep the uncompressed as .original.ply and serve the
+                    # compressed one at scan.ply.
+                    ply_path.rename(scan_dir / "scan.original.ply")
+                    compressed.rename(scan_dir / "scan.ply")
             except Exception:
-                spz_path = None
-        else:
-            spz_path = None
+                pass
 
         # 7. Optional preview MP4 flythrough as a fallback
         progress_mod.set_phase("rendering")
@@ -303,7 +307,7 @@ def run_scan(
             "total_seconds": round(time.time() - t0, 1),
             "mp4_bytes": output_mp4.stat().st_size if output_mp4.exists() else 0,
             "ply_bytes": ply_path.stat().st_size if ply_path.exists() else 0,
-            "spz_bytes": spz_path.stat().st_size if spz_path and spz_path.exists() else 0,
+            "compressed_ply": ply_path.stat().st_size if ply_path.exists() else 0,
         }
     finally:
         progress_mod.set_path(None)
