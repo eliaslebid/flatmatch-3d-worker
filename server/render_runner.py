@@ -8,8 +8,14 @@ down the FastAPI uvicorn parent process. Invoked by pipeline.py as:
 
 from __future__ import annotations
 
+import faulthandler
 import sys
 from pathlib import Path
+
+# Dump Python traceback on SIGSEGV / SIGABRT so we can see where the
+# native crash happens (renderer uses Kaolin CUDA extensions that can
+# segfault silently).
+faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
 def main() -> int:
