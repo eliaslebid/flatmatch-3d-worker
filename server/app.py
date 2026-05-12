@@ -105,10 +105,12 @@ def get_scan(scan_id: str) -> JSONResponse:
     meta = dict(meta)
     scan_dir = _scan_dir(scan_id)
     if meta.get("status") == "done":
-        if (scan_dir / "scan.mp4").exists():
-            meta["mp4_url"] = f"/scans/{scan_id}/scan.mp4"
+        if (scan_dir / "scan.sog").exists():
+            meta["sog_url"] = f"/scans/{scan_id}/scan.sog"
         if (scan_dir / "scan.ply").exists():
             meta["ply_url"] = f"/scans/{scan_id}/scan.ply"
+        if (scan_dir / "scan.mp4").exists():
+            meta["mp4_url"] = f"/scans/{scan_id}/scan.mp4"
     if meta.get("status") == "processing":
         progress_path = scan_dir / "progress.json"
         if progress_path.exists():
@@ -133,6 +135,14 @@ def get_ply(scan_id: str) -> FileResponse:
     if not ply.exists():
         raise HTTPException(status_code=404, detail="ply not ready")
     return FileResponse(ply, media_type="application/octet-stream", filename="scan.ply")
+
+
+@app.get("/scans/{scan_id}/scan.sog")
+def get_sog(scan_id: str) -> FileResponse:
+    sog = _scan_dir(scan_id) / "scan.sog"
+    if not sog.exists():
+        raise HTTPException(status_code=404, detail="sog not ready")
+    return FileResponse(sog, media_type="application/octet-stream", filename="scan.sog")
 
 
 @app.get("/health")
