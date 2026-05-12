@@ -202,12 +202,15 @@ def run_scan(
         images_out.mkdir(parents=True, exist_ok=True)
         for f in raw_frames.glob("*.jpg"):
             shutil.copy(f, images_out / f.name)
-        # Copy sparse to processed/colmap/sparse/0
+        # Copy sparse to processed/colmap/sparse/0.
+        # hloc.reconstruction writes cameras/images/points3D.bin directly
+        # into sfm_dir (not sfm_dir/sparse/0/).
         colmap_out = processed / "colmap" / "sparse" / "0"
         colmap_out.mkdir(parents=True, exist_ok=True)
-        src_sparse = sfm_dir / "sparse" / "0"
-        for f in src_sparse.glob("*"):
-            shutil.copy(f, colmap_out / f.name)
+        for name in ("cameras.bin", "images.bin", "points3D.bin"):
+            src = sfm_dir / name
+            if src.exists():
+                shutil.copy(src, colmap_out / name)
         # Generate transforms.json
         # --colmap-model-path is interpreted relative to --output-dir.
         _stream_run(
