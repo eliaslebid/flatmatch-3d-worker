@@ -4,21 +4,37 @@ Snapshot of what was built, what's running, and how to operate it. Written
 2026-05-12 at the end of a long debugging session — captures every gotcha we
 hit so the next person (or future you) doesn't relearn them.
 
-## Pipeline at 30,000 ft
+## Shipped state (v0 "GLB beta")
+
+After a long debugging session ending 2026-05-12, the shipped configuration is:
+
+- **Compute**: Mac Studio CPU (no rented GPU). Inference at ~3 s/frame,
+  total ~5–15 min per 30 s phone video. **No ongoing cost.**
+- **Output**: colored point-cloud GLB, voxel-grid downsampled to ~500k
+  points, rendered in-app via expo-gl + three.js.
+- **Quality**: fragmented but functional. The official MP4 renderer was
+  attempted and got close — see "Why no official MP4 renderer (yet)" below.
+- **Pod**: terminated. To resume cloud-GPU mode, follow the runbook below.
+
+## Pipeline at 30,000 ft (current GLB beta path)
 
 ```
 iPhone (Modula app, Profile → 3D Scan Beta)
    │  axios POST multipart/form-data, no body limit (LAN)
    ▼
-Mac Studio :8765            ← autossh local-port-forward
-   │  SSH -L 0.0.0.0:8765:localhost:8765
-   ▼
-RunPod pod (currently L40S 48GB, $0.79/hr)
-   ├── uvicorn server.app  →  FastAPI worker
-   ├── lingbot-map (cloned from robbyant/lingbot-map)
-   ├── lingbot-map-long.pt checkpoint (4.4 GB)
-   ├── demo_render/rgbd_render → official CUDA voxel renderer
-   └── render_cuda_ext (frustum_cull_ext + voxel_morton_ext, built in-place)
+Mac Studio :8765
+   └── uvicorn server.app  →  FastAPI worker
+       ├── lingbot-map (cloned to ~/code/lingbot-map)
+       ├── lingbot-map-long.pt checkpoint (4.4 GB)
+       └── pipeline.py → trimesh GLB export
+```
+
+## Cloud-GPU pipeline (when needed, currently OFF)
+
+```
+iPhone → Mac :8765 (autossh -L) → RunPod pod :8765 (L40S 48 GB, $0.79/hr)
+   └── uvicorn server.app  →  FastAPI worker
+       └── (same pipeline.py, picks CUDA + bf16 automatically)
 ```
 
 Per scan:
@@ -267,16 +283,55 @@ and load `outdoor_large.yaml` or `indoor_overview.yaml` instead of
 - For "always-on" beta usage, attach a **50 GB network volume** at
   `/workspace` so the model + Python env persist across pod stops.
 
+## Why no official MP4 renderer (yet)
+
+We got the official `demo_render/rgbd_render` pipeline 95% of the way
+working on the L40S pod:
+
+- ✅ Upgraded torch 2.4 → 2.8.0+cu128 (Kaolin's required version)
+- ✅ Installed Kaolin 0.18.0 for torch 2.8/cu128 (after fighting blinker
+  distutils conflicts)
+- ✅ Built `render_cuda_ext` (`voxel_morton_ext`, `frustum_cull_ext`)
+- ✅ Pipeline runs through inference → NPZ save → SceneBuilder → unproject
+- ❌ **Silent SIGSEGV inside `OctreeSPC.build`** (the next step after unproject)
+
+The crash happens with **no Python traceback even with `faulthandler.enable`**
+— it's a hard native fault in Kaolin's SPC code. Kaolin's basic SPC test
+(`unbatched_points_to_octree`) works fine in isolation, so the bug is
+specific to how rgbd_render uses it.
+
+Subprocess isolation (`server/render_runner.py` in earlier commits) was
+added so the segfault doesn't kill the FastAPI worker — but we couldn't
+get past the segfault itself.
+
+Next time, two paths to try:
+1. Rebuild Kaolin from source against our exact torch/CUDA combo (could be
+   a kernel ABI mismatch with the prebuilt wheel).
+2. Skip Kaolin entirely: rewrite voxelization with `open3d` + GPU CUDA
+   reduction. Or pivot to **Gaussian Splatting** (`nerfstudio` /
+   `splatfacto`), which gives 9/10 quality vs lingbot-map's 3/10 on
+   handheld video.
+
 ## What's NOT done yet
 
-- **Quality is still not where the viral demos are.** The official renderer
-  is wired up but only end-to-end tested with the bundled `example/courthouse`
-  data. Phone-captured walkthroughs still need:
-  - Cinematic camera path tuning (try `outdoor_large.yaml`, raise `point_size`)
-  - Better recording instructions surfaced to the user
-  - Maybe falling back to Gaussian Splatting (`splatfacto`) for static rooms
-- **No network volume** — every pod restart wipes the checkpoint.
-- **No ATS-clean direct path** — currently relies on the Mac being awake on
-  the same WiFi as the phone.
-- **No queue UX** — if the user uploads multiple scans, they serialize but
-  there's no in-app "you're #2 in line" indicator.
+- **Quality is fragmented point cloud, not the photographable demo output.**
+  The fundamental fix is gaussian splatting — see "Why no official MP4
+  renderer".
+- **Mac must be awake on the same WiFi as the phone.** Cellular / hotel
+  WiFi scans need either a TLS-fronted cloud endpoint (Caddy + a custom
+  domain) or a Tailscale exit.
+- **No queue UX in mobile** — multiple uploads serialize silently.
+- **No network volume on the pod** — every pod restart wipes the model.
+
+## Mobile config (snapshot)
+
+- `apps/mobile/.env`:
+  - `EXPO_PUBLIC_SCAN_WORKER_URL=http://192.168.31.99:8765` (Mac LAN)
+  - `EXPO_PUBLIC_SCAN_BETA=1`
+- `apps/mobile/app.config.ts` `ios.infoPlist`:
+  - `NSAppTransportSecurity.NSAllowsLocalNetworking=true`
+  - `NSLocalNetworkUsageDescription="…"`
+- `apps/mobile/ios/HotlineFlat/HotlineFlat.entitlements`: empty `<dict>`
+  (no `aps-environment`, so a free Apple Dev Team can sign).
+- `apps/mobile/ios/HotlineFlat.xcodeproj/project.pbxproj`:
+  `ENABLE_USER_SCRIPT_SANDBOXING=NO` at project level.
