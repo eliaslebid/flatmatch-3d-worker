@@ -74,7 +74,9 @@ def _find_config_yml(train_root: Path) -> Path:
     return candidates[-1]
 
 
-_STEP_RE = re.compile(r"Step\s+(\d+)\s*/\s*(\d+)")
+# Nerfstudio's training stats table prints rows like "7170 (23.90%) ..."
+# rather than "Step N/M". We pair that with --max-num-iterations as the total.
+_STEP_RE = re.compile(r"^\s*(\d+)\s+\((\d+(?:\.\d+)?)%\)")
 
 
 def _hloc_glomap_sfm(
@@ -226,10 +228,12 @@ def run_scan(
         progress_mod.set_phase("training", current=0, total=max_iterations)
 
         def _on_train_line(line: str) -> None:
-            m = _STEP_RE.search(line)
+            # Strip ANSI escapes before matching.
+            clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+            m = _STEP_RE.search(clean)
             if m:
                 progress_mod.set_phase(
-                    "training", current=int(m.group(1)), total=int(m.group(2))
+                    "training", current=int(m.group(1)), total=max_iterations
                 )
 
         train_outputs = work_dir / "outputs"
