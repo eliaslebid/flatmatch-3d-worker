@@ -26,9 +26,13 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO_RENDER_DIR = REPO_ROOT / "demo_render"
 RENDER_EXT_DIR = DEMO_RENDER_DIR / "render_cuda_ext"
-for p in (REPO_ROOT, DEMO_RENDER_DIR, RENDER_EXT_DIR):
-    if p.exists() and str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+
+# IMPORTANT: only add REPO_ROOT to sys.path here. Adding demo_render/ globally
+# would shadow the top-level demo.py with demo_render/demo.py (different
+# load_images signature). We import rgbd_render lazily via importlib in
+# _render_to_mp4().
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from demo import (  # noqa: E402  (demo.py is the script in the repo root)
     load_images,
@@ -98,6 +102,14 @@ def _render_to_mp4(npz_dir: Path, output_mp4: Path) -> None:
             multiprocessing.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
+
+    # rgbd_render lives under demo_render/. We add demo_render/ and
+    # render_cuda_ext/ to sys.path *here* (after demo has already been
+    # imported and cached in sys.modules) so we don't shadow the top-level
+    # demo.py with demo_render/demo.py.
+    for p in (DEMO_RENDER_DIR, RENDER_EXT_DIR):
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
 
     from rgbd_render.config import PipelineConfig
     from rgbd_render.camera import build_camera_path
